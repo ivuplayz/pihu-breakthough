@@ -18,6 +18,7 @@ from werkzeug.exceptions import HTTPException
 
 from pihu_core.audio import audio_transcriber, AudioTranscriptionError
 from pihu_core.config import Config
+from pihu_core.documents import parse_document, DocumentParseError, MAX_DOCUMENTS_PER_REQUEST
 from pihu_core.repository import conversation_repo
 from pihu_core.router import router
 
@@ -150,7 +151,111 @@ def post_chat() -> tuple[Any, int]:
                 status_code=400,
             )
 
-    # 3. 'message' field resolution & validation
+    # 3. Optional 'documents' parsing (PDF, TXT, MD, CSV, JSON)
+    processed_documents: List[Dict[str, Any]] = []
+    if "documents" in data and data["documents"] is not None:
+        raw_documents = data["documents"]
+        if not isinstance(raw_documents, list):
+            return _error_response(
+                code="INVALID_DOCUMENTS_TYPE",
+                message="The 'documents' field must be an array of document objects.",
+                status_code=400,
+            )
+
+        if len(raw_documents) > MAX_DOCUMENTS_PER_REQUEST:
+            return _error_response(
+                code="TOO_MANY_DOCUMENTS",
+                message=f"Maximum of {MAX_DOCUMENTS_PER_REQUEST} documents allowed per request.",
+                status_code=400,
+            )
+
+        for idx, doc_item in enumerate(raw_documents):
+            if not isinstance(doc_item, dict):
+                return _error_response(
+                    code="INVALID_DOCUMENT_ITEM",
+                    message=f"Document item at index {idx} must be an object.",
+                    status_code=400,
+                )
+
+            if "data" not in doc_item:
+                return _error_response(
+                    code="MISSING_DOCUMENT_DATA",
+                    message=f"Document item at index {idx} must contain a 'data' field.",
+                    status_code=400,
+                )
+
+            doc_b64 = doc_item["data"]
+            if not isinstance(doc_b64, str):
+                return _error_response(
+                    code="INVALID_DOCUMENT_DATA",
+                    message=f"Document 'data' at index {idx} must be a base64-encoded string.",
+                    status_code=400,
+                )
+
+            clean_b64 = doc_b64.strip()
+            if clean_b64.startswith("data:"):
+                try:
+                    _, b64_part = clean_b64.split(",", 1)
+                    clean_b64 = b64_part
+                except Exception:
+                    return _error_response(
+                        code="INVALID_DATA_URI",
+                        message=f"Document at index {idx} contains a malformed data URI.",
+                        status_code=400,
+                    )
+
+            if not clean_b64:
+                return _error_response(
+                    code="EMPTY_DOCUMENT_DATA",
+                    message=f"Document data at index {idx} cannot be empty.",
+                    status_code=400,
+                )
+
+            try:
+                doc_bytes = base64.b64decode(clean_b64, validate=True)
+            except Exception:
+                return _error_response(
+                    code="INVALID_BASE64_DOCUMENT",
+                    message=f"Document data at index {idx} is not valid base64.",
+                    status_code=400,
+                )
+
+            filename = str(doc_item.get("filename") or f"document_{idx + 1}.txt").strip()
+            mime_type = doc_item.get("mime_type")
+            if mime_type is not None and not isinstance(mime_type, str):
+                return _error_response(
+                    code="INVALID_DOCUMENT_MIME_TYPE",
+                    message=f"Document 'mime_type' at index {idx} must be a string.",
+                    status_code=400,
+                )
+
+            try:
+                extracted_text = parse_document(
+                    file_data=doc_bytes,
+                    filename=filename,
+                    mime_type=mime_type,
+                )
+                processed_documents.append({
+                    "filename": filename,
+                    "mime_type": mime_type or "application/octet-stream",
+                    "text": extracted_text,
+                })
+            except DocumentParseError as d_err:
+                logger.warning("Document parsing failed for '%s': %s", filename, d_err)
+                return _error_response(
+                    code="DOCUMENT_PARSE_FAILED",
+                    message=f"Failed to parse document '{filename}': {d_err}",
+                    status_code=400,
+                )
+            except Exception as exc:
+                logger.error("Unexpected document parsing error for '%s': %s", filename, exc)
+                return _error_response(
+                    code="DOCUMENT_PARSE_FAILED",
+                    message=f"Failed to parse document '{filename}': {exc}",
+                    status_code=400,
+                )
+
+    # 4. 'message' field resolution & validation
     raw_message = data.get("message")
     if raw_message is not None and not isinstance(raw_message, str):
         return _error_response(
@@ -168,8 +273,12 @@ def post_chat() -> tuple[Any, int]:
         else:
             clean_message = transcribed_text
 
+    # Default query if documents are provided without an explicit message
+    if processed_documents and not clean_message:
+        clean_message = "Please analyze and summarize the attached document(s)."
+
     if not clean_message:
-        if "message" not in data and not has_audio:
+        if "message" not in data and not has_audio and not processed_documents:
             return _error_response(
                 code="MISSING_MESSAGE",
                 message="The 'message' field is required.",
@@ -504,6 +613,9 @@ def post_chat() -> tuple[Any, int]:
                 num_imgs = len(validated_images)
                 tag = f"[Attached {num_imgs} Image{'s' if num_imgs > 1 else ''}]"
                 user_db_content = f"{user_db_content} {tag}"
+            if processed_documents:
+                doc_filenames = ", ".join(d["filename"] for d in processed_documents)
+                user_db_content = f"{user_db_content} [Attached Document(s): {doc_filenames}]"
 
             conversation_repo.save_message(
                 conversation_id=conversation_id,
@@ -526,6 +638,23 @@ def post_chat() -> tuple[Any, int]:
             "You are Pihu, an intelligent, helpful, and empathetic AI assistant. "
             "If the user shares personal facts, preferences, or important project details, "
             "use your 'save_core_memory' tool to remember them for future conversations."
+        )
+
+    # Inject attached document context into system_prompt (In-Context RAG)
+    if processed_documents:
+        doc_blocks = [
+            f"[Attached Document: {doc['filename']}]\n{doc['text']}\n---"
+            for doc in processed_documents
+        ]
+        doc_section = "\n\n".join(doc_blocks)
+        system_prompt = (
+            f"{system_prompt}\n\n"
+            "Document Analysis Context:\n"
+            f"{doc_section}\n\n"
+            "Instructions for Documents:\n"
+            "- The user has provided the document(s) above for context.\n"
+            "- Provide answers, summaries, or analyses strictly grounded in the document content.\n"
+            "- If requested information cannot be found in the document, acknowledge that clearly."
         )
 
     # 7. Execute Real-Time Streaming if requested
@@ -602,6 +731,10 @@ def post_chat() -> tuple[Any, int]:
         if has_audio:
             result["metadata"]["audio_transcribed"] = True
             result["metadata"]["transcription"] = transcribed_text
+
+        if processed_documents:
+            result["metadata"]["documents_attached"] = [d["filename"] for d in processed_documents]
+            result["metadata"]["document_count"] = len(processed_documents)
 
         # Save AI Response to database if available
         if has_db and conversation_id:
