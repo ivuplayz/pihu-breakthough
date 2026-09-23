@@ -1,14 +1,20 @@
-"""Chat endpoint for Pihu-BreakThough API with strict input validation."""
+"""Chat endpoint for Pihu-BreakThough API tying Brain and Memory together.
+
+Stage 4 connects the ProviderRouter with persistent conversation history
+backed by Neon PostgreSQL via ConversationRepository.
+"""
 
 from __future__ import annotations
 
 import logging
 from typing import Any, Dict, List, Optional
+import uuid
 
 from flask import Blueprint, jsonify, request
-
 from werkzeug.exceptions import HTTPException
 
+from pihu_core.config import Config
+from pihu_core.repository import conversation_repo
 from pihu_core.router import router
 
 logger = logging.getLogger(__name__)
@@ -38,17 +44,19 @@ def _error_response(code: str, message: str, status_code: int = 400) -> tuple[An
 
 @chat_bp.route("/chat", methods=["POST"])
 def post_chat() -> tuple[Any, int]:
-    """Process chat interactions with comprehensive validation.
+    """Process chat interactions with persistent conversation memory and multi-tier routing.
 
     Accepts:
         {
             "message": "User query string",
-            "history": [{"role": "user", "content": "..."}, ...],   (optional)
-            "provider": "stage1-deterministic"                     (optional)
+            "conversation_id": "optional-uuid-string",
+            "history": [{"role": "user", "content": "..."}, ...],   (optional client history)
+            "provider": "gemini"                                   (optional provider hint)
+            "strategy": "auto"                                     (optional routing strategy)
         }
 
     Returns:
-        JSON response with deterministic response and future-compatible metadata.
+        JSON response with AI response, conversation_id, active provider, model, and metadata.
     """
     # 1. Content-Type and JSON validity verification
     if not request.is_json:
@@ -61,7 +69,6 @@ def post_chat() -> tuple[Any, int]:
     try:
         data = request.get_json(silent=False)
     except HTTPException as http_err:
-        # Re-raise payload too large or server errors for global handling
         if http_err.code == 413 or (http_err.code and http_err.code >= 500):
             raise
         return _error_response(
@@ -75,8 +82,6 @@ def post_chat() -> tuple[Any, int]:
             message="Request body could not be parsed as valid JSON.",
             status_code=400,
         )
-
-
 
     if data is None or not isinstance(data, dict):
         return _error_response(
@@ -101,7 +106,6 @@ def post_chat() -> tuple[Any, int]:
             status_code=400,
         )
 
-    # 3. 'message' content length and non-emptiness validation
     clean_message = message.strip()
     if not clean_message:
         return _error_response(
@@ -117,8 +121,17 @@ def post_chat() -> tuple[Any, int]:
             status_code=400,
         )
 
-    # 4. 'history' field validation (optional)
-    history: Optional[List[Dict[str, str]]] = None
+    # 3. 'conversation_id' validation (optional)
+    conversation_id = data.get("conversation_id")
+    if conversation_id is not None and not isinstance(conversation_id, str):
+        return _error_response(
+            code="INVALID_CONVERSATION_ID",
+            message="The 'conversation_id' field must be a string.",
+            status_code=400,
+        )
+
+    # 4. 'history' validation (optional client-side history)
+    client_history: Optional[List[Dict[str, str]]] = None
     if "history" in data and data["history"] is not None:
         raw_history = data["history"]
         if not isinstance(raw_history, list):
@@ -163,9 +176,9 @@ def post_chat() -> tuple[Any, int]:
 
             sanitized_history.append({"role": role.lower(), "content": content})
 
-        history = sanitized_history
+        client_history = sanitized_history
 
-    # 5. Optional provider hint validation
+    # 5. Optional parameters (provider hint, strategy)
     provider_name: Optional[str] = None
     if "provider" in data and data["provider"] is not None:
         if not isinstance(data["provider"], str):
@@ -176,16 +189,91 @@ def post_chat() -> tuple[Any, int]:
             )
         provider_name = data["provider"].strip()
 
-    # 6. Execute routed chat logic safely
+    strategy: str = "auto"
+    if "strategy" in data and data["strategy"] is not None:
+        if not isinstance(data["strategy"], str):
+            return _error_response(
+                code="INVALID_STRATEGY_TYPE",
+                message="The 'strategy' field must be a string.",
+                status_code=400,
+            )
+        strategy = data["strategy"].strip()
+
+    # 6. Conversation & Memory Resolution
+    effective_history: List[Dict[str, str]] = []
+    has_db = conversation_repo.is_available()
+
+    if has_db:
+        try:
+            # Resolve or create conversation
+            if conversation_id:
+                conv = conversation_repo.get_conversation(conversation_id)
+                if not conv:
+                    conv = conversation_repo.create_conversation(title=clean_message[:50])
+                    conversation_id = conv["id"]
+            else:
+                conv = conversation_repo.create_conversation(title=clean_message[:50])
+                conversation_id = conv["id"]
+
+            # Load persistent history from database
+            db_messages = conversation_repo.get_messages(conversation_id, limit=MAX_HISTORY_ITEMS)
+            for m in db_messages:
+                effective_history.append({"role": m["role"], "content": m["content"]})
+
+            # Save incoming User message to database
+            conversation_repo.save_message(
+                conversation_id=conversation_id,
+                role="user",
+                content=clean_message,
+            )
+        except Exception as exc:
+            logger.warning("Database conversation resolution failed: %s. Continuing with client memory.", exc)
+            if not conversation_id:
+                conversation_id = str(uuid.uuid4())
+            effective_history = client_history or []
+    else:
+        # Fallback when database is unconfigured (preserves zero-dependency standalone execution)
+        if not conversation_id:
+            conversation_id = str(uuid.uuid4())
+        effective_history = client_history or []
+
+    # 7. Execute Brain Routing
     try:
         result = router.route_chat(
             message=clean_message,
-            history=history,
+            history=effective_history,
+            strategy=strategy,
             provider_name=provider_name,
         )
-        return jsonify(result), 200
+
+        ai_response = result["response"]
+        active_provider = result["provider"]
+
+        # Save AI Response to database if available
+        if has_db and conversation_id:
+            try:
+                conversation_repo.save_message(
+                    conversation_id=conversation_id,
+                    role="assistant",
+                    content=ai_response,
+                    provider_used=active_provider,
+                )
+            except Exception as exc:
+                logger.warning("Failed to persist assistant response to database: %s", exc)
+
+        response_payload = {
+            "ok": True,
+            "app": Config.APP_NAME,
+            "conversation_id": conversation_id,
+            "response": ai_response,
+            "provider": active_provider,
+            "model": result["model"],
+            "metadata": result["metadata"],
+        }
+        return jsonify(response_payload), 200
+
     except Exception as exc:
-        logger.exception("Error processing chat message: %s", exc)
+        logger.exception("Error processing chat interaction: %s", exc)
         return _error_response(
             code="INTERNAL_SERVER_ERROR",
             message="An unexpected error occurred while processing the chat request.",

@@ -265,17 +265,41 @@ class DatabaseManager:
                 cur.execute(statement, params)
                 return cur.rowcount if cur.rowcount is not None else 0
 
-    def initialize_schema(self) -> None:
-        """Placeholder for future schema migrations.
+    def run_migrations(self, schema_path: Optional[str] = None) -> bool:
+        """Read and execute the database schema DDL migrations from schema.sql.
 
-        Stage 2 explicitly avoids any table or schema creation (deferred to Stage 4).
+        Args:
+            schema_path: Optional custom path to SQL migration file. Defaults to pihu_core/schema.sql.
+
+        Returns:
+            True if migrations succeeded.
 
         Raises:
-            NotImplementedError: Schema and migration setup is strictly deferred to Stage 4.
+            RuntimeError: If database is unconfigured.
+            FileNotFoundError: If schema file cannot be found.
+            Exception: If SQL execution fails.
         """
-        raise NotImplementedError(
-            "Database schema and table creation are deferred to Stage 4."
-        )
+        if not self.is_configured():
+            raise RuntimeError("Database is not configured. Cannot run migrations.")
+
+        if schema_path is None:
+            import os
+            schema_path = os.path.join(os.path.dirname(__file__), "schema.sql")
+
+        with open(schema_path, "r", encoding="utf-8") as f:
+            sql_content = f.read()
+
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql_content)
+
+        logger.info("Database migrations successfully executed from %s.", schema_path)
+        return True
+
+    def initialize_schema(self) -> None:
+        """Initialize the database schema by executing migrations from schema.sql."""
+        self.run_migrations()
+
 
 
 

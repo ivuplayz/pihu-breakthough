@@ -298,8 +298,8 @@ class TestStage1Core(unittest.TestCase):
         self.assertEqual(info["configured"], False)
         self.assertEqual(info["status"], "NOT CONFIGURED")
 
-        # Ensure schema creation is deferred
-        with self.assertRaises(NotImplementedError):
+        # Unconfigured schema initialization raises RuntimeError
+        with self.assertRaises(RuntimeError):
             mgr.initialize_schema()
 
     def test_provider_router_and_fallbacks(self) -> None:

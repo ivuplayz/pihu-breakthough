@@ -147,12 +147,13 @@ class TestStage2Database(unittest.TestCase):
         mock_conn.rollback.assert_called_once()
         mock_conn.close.assert_called_once()
 
-    def test_initialize_schema_deferred_to_stage_4(self) -> None:
-        """Schema migrations must be strictly deferred to Stage 4."""
+    def test_initialize_schema_delegates_to_run_migrations(self) -> None:
+        """initialize_schema delegates to run_migrations, raising RuntimeError when unconfigured."""
         mgr = DatabaseManager()
-        with self.assertRaises(NotImplementedError) as ctx:
+        with self.assertRaises(RuntimeError) as ctx:
             mgr.initialize_schema()
-        self.assertIn("Stage 4", str(ctx.exception))
+        self.assertIn("not configured", str(ctx.exception).lower())
+
 
     # --------------------------------------------------------------------------
     # 3. GET /api/health Dynamic Database Reporting Tests

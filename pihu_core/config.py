@@ -33,7 +33,7 @@ class Config:
 
     APP_NAME: str = "Pihu-BreakThough"
     VERSION: str = "1.0.0"
-    STAGE: str = "Stage 2"
+    STAGE: str = "Stage 4"
 
     # Server settings
     ENV: str = os.getenv("FLASK_ENV") or "production"
