@@ -51,6 +51,7 @@ def create_app(config_class: type[Config] = Config) -> Flask:
     # Global custom error handlers (preventing any stack trace exposure)
     @app.errorhandler(400)
     def handle_bad_request(error: Exception) -> tuple[Any, int]:
+        """Handle 400 Bad Request errors with uniform JSON response."""
         return (
             jsonify(
                 {
@@ -66,6 +67,7 @@ def create_app(config_class: type[Config] = Config) -> Flask:
 
     @app.errorhandler(404)
     def handle_not_found(error: Exception) -> tuple[Any, int]:
+        """Handle 404 Not Found errors with uniform JSON response."""
         return (
             jsonify(
                 {
@@ -81,6 +83,7 @@ def create_app(config_class: type[Config] = Config) -> Flask:
 
     @app.errorhandler(405)
     def handle_method_not_allowed(error: Exception) -> tuple[Any, int]:
+        """Handle 405 Method Not Allowed errors with uniform JSON response."""
         return (
             jsonify(
                 {
@@ -96,6 +99,7 @@ def create_app(config_class: type[Config] = Config) -> Flask:
 
     @app.errorhandler(413)
     def handle_payload_too_large(error: Exception) -> tuple[Any, int]:
+        """Handle 413 Payload Too Large errors with uniform JSON response."""
         return (
             jsonify(
                 {
@@ -111,6 +115,7 @@ def create_app(config_class: type[Config] = Config) -> Flask:
 
     @app.errorhandler(500)
     def handle_internal_error(error: Exception) -> tuple[Any, int]:
+        """Handle 500 Internal Server errors, logging securely without leaking traces."""
         logger.error("Unhandled internal server error: %s", error, exc_info=True)
         return (
             jsonify(
@@ -133,8 +138,9 @@ app = create_app()
 
 if __name__ == "__main__":
     logger.info(
-        "Starting %s (Stage 1) on port %s [debug=%s]",
+        "Starting %s (%s) on port %s [debug=%s]",
         Config.APP_NAME,
+        Config.STAGE,
         Config.PORT,
         Config.DEBUG,
     )
@@ -143,3 +149,4 @@ if __name__ == "__main__":
         port=Config.PORT,
         debug=Config.DEBUG,
     )
+

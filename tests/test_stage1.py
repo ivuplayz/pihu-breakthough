@@ -84,7 +84,7 @@ class TestStage1Core(unittest.TestCase):
         metadata = data.get("metadata", {})
         self.assertEqual(metadata.get("history_length"), 0)
         self.assertEqual(metadata.get("received_chars"), len(payload["message"]))
-        self.assertEqual(metadata.get("stage"), "Stage 1")
+        self.assertEqual(metadata.get("stage"), Config.STAGE)
 
     def test_chat_valid_with_history(self) -> None:
         """POST /api/chat with conversation history must accurately reflect context."""

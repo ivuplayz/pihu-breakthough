@@ -198,14 +198,85 @@ class DatabaseManager:
             info["error"] = check_result["error"]
         return info
 
+    def execute_query(
+        self,
+        query: str,
+        params: Optional[Any] = None,
+        timeout: int = 5,
+    ) -> List[Dict[str, Any]]:
+        """Execute a read query using strict parameterization to structurally prevent SQL injection.
+
+        Args:
+            query: The SQL query containing placeholders (%s or %(name)s). Dynamic string
+                   concatenation or formatting of untrusted input is strictly prohibited.
+            params: Sequence of values or dictionary mapping parameter names to values.
+            timeout: Connection timeout in seconds.
+
+        Returns:
+            List of row dictionaries where keys correspond to column names.
+
+        Raises:
+            RuntimeError: If database is unconfigured or driver unavailable.
+            Exception: If query execution fails.
+        """
+        if not self.is_configured():
+            raise RuntimeError("Database is not configured.")
+
+        with self.get_connection(timeout=timeout) as conn:
+            # Use dict_row factory if psycopg 3 is available
+            row_factory = getattr(getattr(psycopg, "rows", None), "dict_row", None)
+            cursor_kwargs = {"row_factory": row_factory} if row_factory else {}
+            with conn.cursor(**cursor_kwargs) as cur:
+                cur.execute(query, params)
+                records = cur.fetchall()
+                if records and isinstance(records[0], dict):
+                    return list(records)
+                # Fallback column mapping if dict_row is unavailable
+                if cur.description:
+                    columns = [desc[0] for desc in cur.description]
+                    return [dict(zip(columns, row)) for row in records]
+                return []
+
+    def execute_statement(
+        self,
+        statement: str,
+        params: Optional[Any] = None,
+        timeout: int = 5,
+    ) -> int:
+        """Execute a write statement (INSERT/UPDATE/DELETE) using strict parameterization.
+
+        Args:
+            statement: The SQL statement containing placeholders (%s or %(name)s).
+            params: Sequence of values or dictionary mapping parameter names to values.
+            timeout: Connection timeout in seconds.
+
+        Returns:
+            Number of rows affected (rowcount).
+
+        Raises:
+            RuntimeError: If database is unconfigured or driver unavailable.
+            Exception: If statement execution fails.
+        """
+        if not self.is_configured():
+            raise RuntimeError("Database is not configured.")
+
+        with self.get_connection(timeout=timeout) as conn:
+            with conn.cursor() as cur:
+                cur.execute(statement, params)
+                return cur.rowcount if cur.rowcount is not None else 0
+
     def initialize_schema(self) -> None:
         """Placeholder for future schema migrations.
 
         Stage 2 explicitly avoids any table or schema creation (deferred to Stage 4).
+
+        Raises:
+            NotImplementedError: Schema and migration setup is strictly deferred to Stage 4.
         """
         raise NotImplementedError(
             "Database schema and table creation are deferred to Stage 4."
         )
+
 
 
 # Global singleton database manager instance

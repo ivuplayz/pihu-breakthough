@@ -8,6 +8,12 @@ __pycache__/
 .env.local
 .env.*.local
 *.env
+Database_URL.txt
+*credential*
+*secret*
+*.key
+*.token
+
 
 # Virtual environments
 venv/

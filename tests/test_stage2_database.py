@@ -189,6 +189,46 @@ class TestStage2Database(unittest.TestCase):
             self.assertEqual(data["database"], "error")
             self.assertEqual(data["database_error"], safe_reason)
 
+    # --------------------------------------------------------------------------
+    # 4. Parameterized Query & Injection Safety Tests
+    # --------------------------------------------------------------------------
+    @patch("psycopg.connect")
+    def test_execute_query_parameterized(self, mock_connect: MagicMock) -> None:
+        """execute_query passes parameters to cursor and returns records."""
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_cursor.fetchall.return_value = [{"id": 1, "name": "Pihu"}]
+        mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+        mock_connect.return_value = mock_conn
+
+        mgr = DatabaseManager(database_url="postgresql://user:pass@host/db")
+        result = mgr.execute_query("SELECT id, name FROM users WHERE id = %s;", (1,))
+        self.assertEqual(result, [{"id": 1, "name": "Pihu"}])
+        mock_cursor.execute.assert_called_with("SELECT id, name FROM users WHERE id = %s;", (1,))
+
+    @patch("psycopg.connect")
+    def test_execute_statement_parameterized(self, mock_connect: MagicMock) -> None:
+        """execute_statement passes parameters and returns affected row count."""
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_cursor.rowcount = 3
+        mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+        mock_connect.return_value = mock_conn
+
+        mgr = DatabaseManager(database_url="postgresql://user:pass@host/db")
+        count = mgr.execute_statement("DELETE FROM logs WHERE created_at < %s;", ("2026-01-01",))
+        self.assertEqual(count, 3)
+        mock_cursor.execute.assert_called_with("DELETE FROM logs WHERE created_at < %s;", ("2026-01-01",))
+
+    def test_execute_query_unconfigured_raises(self) -> None:
+        """execute_query and execute_statement raise RuntimeError if unconfigured."""
+        mgr = DatabaseManager(database_url=None)
+        with self.assertRaises(RuntimeError):
+            mgr.execute_query("SELECT 1;")
+        with self.assertRaises(RuntimeError):
+            mgr.execute_statement("DELETE FROM logs;")
+
 
 if __name__ == "__main__":
     unittest.main()
+
