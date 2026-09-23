@@ -205,3 +205,56 @@ tool_registry.register(
         "required": ["query"],
     },
 )
+
+
+def save_core_memory(category: str, content: str) -> str:
+    """Save an important user preference, fact, or project context to long-term memory.
+
+    Args:
+        category: Broad category classification (e.g., 'preference', 'fact', 'project').
+        content: The core fact or context to remember about the user.
+
+    Returns:
+        Status message confirming the memory has been saved.
+    """
+    clean_category = (category or "fact").strip().lower()
+    clean_content = (content or "").strip()
+    if not clean_content:
+        return "Error: Memory content cannot be empty."
+
+    try:
+        from pihu_core.repository import ConversationRepository
+        repo = ConversationRepository()
+        if not repo.is_available():
+            return "Memory storage is currently unavailable (database unconfigured)."
+
+        repo.save_memory(
+            category=clean_category,
+            content=clean_content,
+        )
+        return f"Successfully saved to long-term memory under category '{clean_category}': {clean_content}"
+    except Exception as exc:
+        logger.error("Failed to save core memory: %s", exc)
+        return f"Error saving memory: {exc}"
+
+
+tool_registry.register(
+    save_core_memory,
+    name="save_core_memory",
+    description="Save an important user preference, personal fact, or project context to long-term memory for future conversations.",
+    parameters_schema={
+        "type": "object",
+        "properties": {
+            "category": {
+                "type": "string",
+                "description": "Category of the memory (e.g., 'preference', 'fact', 'project').",
+            },
+            "content": {
+                "type": "string",
+                "description": "The specific detail, fact, or preference to remember.",
+            },
+        },
+        "required": ["category", "content"],
+    },
+)
+

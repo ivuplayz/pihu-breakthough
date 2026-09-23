@@ -212,7 +212,9 @@ def post_chat() -> tuple[Any, int]:
 
     # 6. Conversation & Memory Resolution
     effective_history: List[Dict[str, str]] = []
+    user_id: Optional[str] = None
     has_db = conversation_repo.is_available()
+    system_prompt: Optional[str] = None
 
     if has_db:
         try:
@@ -222,14 +224,37 @@ def post_chat() -> tuple[Any, int]:
                 if not conv:
                     conv = conversation_repo.create_conversation(title=clean_message[:50])
                     conversation_id = conv["id"]
+                    user_id = conv.get("user_id")
+                else:
+                    user_id = conv.get("user_id")
             else:
                 conv = conversation_repo.create_conversation(title=clean_message[:50])
                 conversation_id = conv["id"]
+                user_id = conv.get("user_id")
 
             # Load persistent history from database
             db_messages = conversation_repo.get_messages(conversation_id, limit=MAX_HISTORY_ITEMS)
             for m in db_messages:
                 effective_history.append({"role": m["role"], "content": m["content"]})
+
+            # Fetch existing long-term user memories
+            user_memories = conversation_repo.get_memories(user_id=user_id)
+            if user_memories:
+                memory_lines = [
+                    f"- [{m.get('category', 'general').capitalize()}] {m.get('content')}"
+                    for m in user_memories
+                    if m.get("content")
+                ]
+                if memory_lines:
+                    memories_text = "\n".join(memory_lines)
+                    system_prompt = (
+                        "You are Pihu, an intelligent, helpful, and empathetic AI assistant.\n\n"
+                        "User Context/Memories:\n"
+                        f"{memories_text}\n\n"
+                        "Instructions:\n"
+                        "- Use the above user context to provide personalized, relevant, and context-aware responses.\n"
+                        "- If the user shares new important facts, personal preferences, or project details, use your 'save_core_memory' tool to persist them."
+                    )
 
             # Save incoming User message to database
             conversation_repo.save_message(
@@ -248,6 +273,13 @@ def post_chat() -> tuple[Any, int]:
             conversation_id = str(uuid.uuid4())
         effective_history = client_history or []
 
+    if not system_prompt:
+        system_prompt = (
+            "You are Pihu, an intelligent, helpful, and empathetic AI assistant. "
+            "If the user shares personal facts, preferences, or important project details, "
+            "use your 'save_core_memory' tool to remember them for future conversations."
+        )
+
     # 7. Execute Real-Time Streaming if requested
     if stream_requested:
         @stream_with_context
@@ -261,6 +293,7 @@ def post_chat() -> tuple[Any, int]:
                     history=effective_history,
                     strategy=strategy,
                     provider_name=provider_name,
+                    system_prompt=system_prompt,
                 ):
                     chunk_text = chunk_event.get("text", "")
                     chunk_prov = chunk_event.get("provider", final_provider)
@@ -310,6 +343,7 @@ def post_chat() -> tuple[Any, int]:
             history=effective_history,
             strategy=strategy,
             provider_name=provider_name,
+            system_prompt=system_prompt,
         )
 
         ai_response = result["response"]

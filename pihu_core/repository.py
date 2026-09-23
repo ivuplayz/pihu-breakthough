@@ -203,6 +203,85 @@ class ConversationRepository:
                     msg[key] = str(msg[key])
         return rows
 
+    def save_memory(
+        self,
+        user_id: Optional[str] = None,
+        category: str = "fact",
+        content: str = "",
+    ) -> Dict[str, Any]:
+        """Save a long-term memory for a user.
+
+        Args:
+            user_id: Optional UUID string of user. Defaults to primary user.
+            category: Broad memory category (e.g. 'preference', 'fact', 'project').
+            content: Information to remember.
+
+        Returns:
+            Saved memory record dictionary.
+        """
+        if not self.is_available():
+            raise RuntimeError("Database is unconfigured. Cannot save memory.")
+
+        if not user_id:
+            user = self.get_or_create_default_user()
+            user_id = user["id"]
+
+        clean_category = category.strip().lower() if category else "fact"
+        clean_content = content.strip()
+        if not clean_content:
+            raise ValueError("Memory content cannot be empty.")
+
+        rows = self.db.execute_query(
+            """
+            INSERT INTO memories (user_id, category, content)
+            VALUES (%s, %s, %s)
+            RETURNING id, user_id, category, content, timestamp;
+            """,
+            (user_id, clean_category, clean_content),
+        )
+        mem = rows[0]
+        for key in ("id", "user_id"):
+            if isinstance(mem.get(key), uuid.UUID):
+                mem[key] = str(mem[key])
+        return mem
+
+    def get_memories(
+        self,
+        user_id: Optional[str] = None,
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        """Retrieve all saved memories for a user.
+
+        Args:
+            user_id: Optional UUID string of user. Defaults to primary user.
+            limit: Maximum number of memories to return (default: 50).
+
+        Returns:
+            List of memory dictionaries.
+        """
+        if not self.is_available():
+            raise RuntimeError("Database is unconfigured. Cannot query memories.")
+
+        if not user_id:
+            user = self.get_or_create_default_user()
+            user_id = user["id"]
+
+        rows = self.db.execute_query(
+            """
+            SELECT id, user_id, category, content, timestamp
+            FROM memories
+            WHERE user_id = %s
+            ORDER BY timestamp DESC
+            LIMIT %s;
+            """,
+            (user_id, limit),
+        )
+        for mem in rows:
+            for key in ("id", "user_id"):
+                if isinstance(mem.get(key), uuid.UUID):
+                    mem[key] = str(mem[key])
+        return rows
+
 
 # Global singleton repository instance
 conversation_repo = ConversationRepository()
