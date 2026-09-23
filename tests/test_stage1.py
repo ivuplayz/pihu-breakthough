@@ -56,7 +56,7 @@ class TestStage1Core(unittest.TestCase):
         self.assertIsNotNone(data)
         self.assertEqual(data.get("status"), "healthy")
         self.assertEqual(data.get("app"), "Pihu-BreakThough")
-        self.assertEqual(data.get("stage"), "Stage 1")
+        self.assertEqual(data.get("stage"), Config.STAGE)
         self.assertEqual(data.get("database"), "NOT CONFIGURED")
         self.assertEqual(data.get("router"), "active")
         self.assertEqual(data.get("active_provider"), "stage1-deterministic")

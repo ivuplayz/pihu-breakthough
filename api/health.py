@@ -18,10 +18,11 @@ health_bp = Blueprint("health", __name__)
 def get_health() -> tuple[Any, int]:
     """Return structured system and component health status.
 
-    Returns:
-        JSON response with system health, database status, and active provider info.
+    Dynamically verifies Neon PostgreSQL connectivity using check_connection()
+    and safely reports 'NOT CONFIGURED', 'connected', or 'error'.
     """
-    db_status = db_manager.get_status()
+    db_check = db_manager.check_connection()
+    db_status = db_check.get("status", "error")
 
     payload: Dict[str, Any] = {
         "status": "healthy",
@@ -33,5 +34,9 @@ def get_health() -> tuple[Any, int]:
         "available_providers": router.list_available_providers(),
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
+
+    # Include sanitized failure reason if database check encountered an error
+    if db_status == "error" and "error" in db_check:
+        payload["database_error"] = db_check["error"]
 
     return jsonify(payload), 200
