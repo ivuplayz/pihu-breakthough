@@ -6,6 +6,7 @@ import time
 import unittest
 from unittest.mock import MagicMock, patch
 
+from pihu_core.config import Config
 from pihu_core.providers import (
     BaseProvider,
     GeminiProvider,
@@ -264,15 +265,66 @@ class TestStage3BrainRouter(unittest.TestCase):
         self.assertIsInstance(caps.to_dict(), dict)
 
     # --------------------------------------------------------------------------
-    # 6. Streaming Generation Tests
+    # 6. Streaming Generation & Tool-Calling Routing Tests
     # --------------------------------------------------------------------------
     def test_route_stream_deterministic_fallback(self) -> None:
         """route_stream yields chunks and concludes with is_final=True."""
         test_router = ProviderRouter()
-        chunks = list(test_router.route_stream(message="Stream test message"))
-        self.assertGreater(len(chunks), 0)
-        self.assertTrue(chunks[-1]["is_final"])
-        self.assertEqual(chunks[-1]["provider"], "stage1-deterministic")
+        with patch.object(Config, "GEMINI_API_KEY", ""), patch.object(Config, "GROQ_API_KEY", ""):
+            chunks = list(test_router.route_stream(message="Stream test message"))
+            self.assertGreater(len(chunks), 0)
+            self.assertTrue(chunks[-1]["is_final"])
+            self.assertEqual(chunks[-1]["provider"], "stage1-deterministic")
+
+    @patch("duckduckgo_search.DDGS")
+    def test_router_with_tool_calling_loop(self, mock_ddgs_cls: MagicMock) -> None:
+        """ProviderRouter executes tool calling loop when provider requests tool execution."""
+        mock_ddgs_instance = MagicMock()
+        mock_ddgs_instance.text.return_value = [
+            {
+                "title": "Python 3.13 Release Notes",
+                "body": "Python 3.13 includes free-threaded CPython and a new JIT.",
+                "href": "https://python.org/doc/3.13",
+            }
+        ]
+        mock_ddgs_cls.return_value = mock_ddgs_instance
+
+        class MockToolCallingProvider(BaseProvider):
+            @property
+            def name(self) -> str:
+                return "mock-tool-caller"
+
+            @property
+            def model_name(self) -> str:
+                return "mock-tool-v1"
+
+            @property
+            def capabilities(self) -> ProviderCapabilities:
+                return ProviderCapabilities(supports_tools=True, supports_streaming=True)
+
+            def is_available(self) -> bool:
+                return True
+
+            def generate(self, message: str, **kwargs: Any) -> ProviderResponse:
+                from pihu_core.tools import tool_registry
+                search_res = tool_registry.execute("search_web", query="Python 3.13")
+                return ProviderResponse(
+                    content=f"Grounded answer with search: {search_res}",
+                    provider=self.name,
+                    model=self.model_name,
+                )
+
+        test_router = ProviderRouter()
+        tool_p = MockToolCallingProvider()
+        test_router.register_provider(tool_p)
+
+        result = test_router.route_chat(
+            message="What is in Python 3.13?",
+            provider_name="mock-tool-caller",
+        )
+        self.assertTrue(result["ok"])
+        self.assertIn("Python 3.13 includes free-threaded CPython", result["response"])
+        mock_ddgs_instance.text.assert_called_once_with("Python 3.13", max_results=5)
 
 
 if __name__ == "__main__":

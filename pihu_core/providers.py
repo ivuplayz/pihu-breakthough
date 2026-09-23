@@ -11,6 +11,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
+import json
 import logging
 import math
 from typing import Any, Dict, Generator, List, Optional
@@ -148,6 +149,7 @@ class BaseProvider(ABC):
         message: str,
         history: Optional[List[Dict[str, str]]] = None,
         system_prompt: Optional[str] = None,
+        tools: Optional[List[Any]] = None,
         **kwargs: Any,
     ) -> ProviderResponse:
         """Generate a complete synchronous response."""
@@ -158,13 +160,20 @@ class BaseProvider(ABC):
         message: str,
         history: Optional[List[Dict[str, str]]] = None,
         system_prompt: Optional[str] = None,
+        tools: Optional[List[Any]] = None,
         **kwargs: Any,
     ) -> Generator[StreamChunk, None, None]:
         """Generate response tokens as a stream.
 
         Default implementation falls back to emitting full generate() content as a single chunk.
         """
-        resp = self.generate(message=message, history=history, system_prompt=system_prompt, **kwargs)
+        resp = self.generate(
+            message=message,
+            history=history,
+            system_prompt=system_prompt,
+            tools=tools,
+            **kwargs,
+        )
         yield StreamChunk(
             text=resp.content,
             is_final=True,
@@ -204,6 +213,7 @@ class Stage1DeterministicProvider(BaseProvider):
         message: str,
         history: Optional[List[Dict[str, str]]] = None,
         system_prompt: Optional[str] = None,
+        tools: Optional[List[Any]] = None,
         **kwargs: Any,
     ) -> ProviderResponse:
         history_len = len(history) if history else 0
@@ -232,9 +242,16 @@ class Stage1DeterministicProvider(BaseProvider):
         message: str,
         history: Optional[List[Dict[str, str]]] = None,
         system_prompt: Optional[str] = None,
+        tools: Optional[List[Any]] = None,
         **kwargs: Any,
     ) -> Generator[StreamChunk, None, None]:
-        resp = self.generate(message=message, history=history, system_prompt=system_prompt, **kwargs)
+        resp = self.generate(
+            message=message,
+            history=history,
+            system_prompt=system_prompt,
+            tools=tools,
+            **kwargs,
+        )
         words = resp.content.split(" ")
         for i, word in enumerate(words):
             is_last = i == len(words) - 1
@@ -314,6 +331,7 @@ class GeminiProvider(BaseProvider):
         message: str,
         history: Optional[List[Dict[str, str]]] = None,
         system_prompt: Optional[str] = None,
+        tools: Optional[List[Any]] = None,
         **kwargs: Any,
     ) -> ProviderResponse:
         """Generate response via Google Gemini API using google-genai SDK."""
@@ -325,12 +343,21 @@ class GeminiProvider(BaseProvider):
             contents = self._build_contents(message=message, history=history)
             timeout = kwargs.get("timeout", 30)
 
+            active_tools = tools
+            if active_tools is None and "tools" in kwargs:
+                active_tools = kwargs["tools"]
+            if active_tools is None:
+                from pihu_core.tools import tool_registry
+                active_tools = tool_registry.to_gemini_format()
+
             config = None
             config_kwargs: Dict[str, Any] = {}
             if system_prompt:
                 config_kwargs["system_instruction"] = system_prompt
             if timeout and types:
                 config_kwargs["http_options"] = types.HttpOptions(timeout=timeout)
+            if active_tools and types:
+                config_kwargs["tools"] = active_tools
             if config_kwargs and types:
                 config = types.GenerateContentConfig(**config_kwargs)
 
@@ -339,6 +366,42 @@ class GeminiProvider(BaseProvider):
                 call_kwargs["config"] = config
 
             response = client.models.generate_content(**call_kwargs)
+
+            # Check if LLM requested tool calling
+            function_calls = getattr(response, "function_calls", None)
+            if isinstance(function_calls, (list, tuple)) and len(function_calls) > 0:
+                from pihu_core.tools import tool_registry
+
+                if hasattr(response, "candidates") and response.candidates and hasattr(response.candidates[0], "content") and response.candidates[0].content:
+                    contents.append(response.candidates[0].content)
+
+                for fc in function_calls:
+                    fc_name = getattr(fc, "name", "")
+                    fc_args = getattr(fc, "args", {}) or {}
+                    if not isinstance(fc_args, dict):
+                        fc_args = {}
+                    tool_result = tool_registry.execute(fc_name, **fc_args)
+
+                    if types:
+                        contents.append(
+                            types.Content(
+                                role="tool",
+                                parts=[
+                                    types.Part.from_function_response(
+                                        name=fc_name,
+                                        response={"result": str(tool_result)},
+                                    )
+                                ],
+                            )
+                        )
+                    else:
+                        contents.append({
+                            "role": "tool",
+                            "parts": [{"function_response": {"name": fc_name, "response": {"result": str(tool_result)}}}],
+                        })
+
+                # Second request to LLM grounded in tool result
+                response = client.models.generate_content(**call_kwargs)
 
             text_output = response.text if response and hasattr(response, "text") else ""
             timestamp = datetime.now(timezone.utc).isoformat()
@@ -363,6 +426,7 @@ class GeminiProvider(BaseProvider):
         message: str,
         history: Optional[List[Dict[str, str]]] = None,
         system_prompt: Optional[str] = None,
+        tools: Optional[List[Any]] = None,
         **kwargs: Any,
     ) -> Generator[StreamChunk, None, None]:
         """Stream response tokens via Google Gemini API using google-genai SDK."""
@@ -374,18 +438,69 @@ class GeminiProvider(BaseProvider):
             contents = self._build_contents(message=message, history=history)
             timeout = kwargs.get("timeout", 30)
 
+            active_tools = tools
+            if active_tools is None and "tools" in kwargs:
+                active_tools = kwargs["tools"]
+            if active_tools is None:
+                from pihu_core.tools import tool_registry
+                active_tools = tool_registry.to_gemini_format()
+
             config = None
             config_kwargs: Dict[str, Any] = {}
             if system_prompt:
                 config_kwargs["system_instruction"] = system_prompt
             if timeout and types:
                 config_kwargs["http_options"] = types.HttpOptions(timeout=timeout)
+            if active_tools and types:
+                config_kwargs["tools"] = active_tools
             if config_kwargs and types:
                 config = types.GenerateContentConfig(**config_kwargs)
 
             call_kwargs: Dict[str, Any] = {"model": self.model_name, "contents": contents}
             if config:
                 call_kwargs["config"] = config
+
+            if active_tools:
+                probe_resp = client.models.generate_content(**call_kwargs)
+                function_calls = getattr(probe_resp, "function_calls", None)
+                if isinstance(function_calls, (list, tuple)) and len(function_calls) > 0:
+                    from pihu_core.tools import tool_registry
+
+                    if hasattr(probe_resp, "candidates") and probe_resp.candidates and hasattr(probe_resp.candidates[0], "content") and probe_resp.candidates[0].content:
+                        contents.append(probe_resp.candidates[0].content)
+
+                    for fc in function_calls:
+                        fc_name = getattr(fc, "name", "")
+                        fc_args = getattr(fc, "args", {}) or {}
+                        if not isinstance(fc_args, dict):
+                            fc_args = {}
+                        tool_result = tool_registry.execute(fc_name, **fc_args)
+
+                        if types:
+                            contents.append(
+                                types.Content(
+                                    role="tool",
+                                    parts=[
+                                        types.Part.from_function_response(
+                                            name=fc_name,
+                                            response={"result": str(tool_result)},
+                                        )
+                                    ],
+                                )
+                            )
+                        else:
+                            contents.append({
+                                "role": "tool",
+                                "parts": [{"function_response": {"name": fc_name, "response": {"result": str(tool_result)}}}],
+                            })
+
+                    response_stream = client.models.generate_content_stream(**call_kwargs)
+                    for chunk in response_stream:
+                        chunk_text = chunk.text if hasattr(chunk, "text") and chunk.text else ""
+                        if chunk_text:
+                            yield StreamChunk(text=chunk_text, is_final=False)
+                    yield StreamChunk(text="", is_final=True)
+                    return
 
             response_stream = client.models.generate_content_stream(**call_kwargs)
 
@@ -454,9 +569,10 @@ class GroqProvider(BaseProvider):
         message: str,
         history: Optional[List[Dict[str, str]]] = None,
         system_prompt: Optional[str] = None,
+        tools: Optional[List[Any]] = None,
         **kwargs: Any,
     ) -> ProviderResponse:
-        """Generate response via Groq API."""
+        """Generate response via Groq API with tool calling support."""
         if not self.is_available():
             raise RuntimeError("GROQ_API_KEY is not configured or groq SDK is unavailable.")
 
@@ -465,11 +581,67 @@ class GroqProvider(BaseProvider):
             messages = self._build_messages(message=message, history=history, system_prompt=system_prompt)
             temperature = kwargs.get("temperature", 0.7)
 
-            completion = client.chat.completions.create(
-                model=self.model_name,
-                messages=messages,
-                temperature=temperature,
-            )
+            active_tools = tools
+            if active_tools is None and "tools" in kwargs:
+                active_tools = kwargs["tools"]
+            if active_tools is None:
+                from pihu_core.tools import tool_registry
+                active_tools = tool_registry.to_openai_format()
+
+            call_kwargs: Dict[str, Any] = {
+                "model": self.model_name,
+                "messages": messages,
+                "temperature": temperature,
+            }
+            if active_tools:
+                call_kwargs["tools"] = active_tools
+
+            completion = client.chat.completions.create(**call_kwargs)
+            message_choice = completion.choices[0].message
+            tool_calls = getattr(message_choice, "tool_calls", None)
+
+            if isinstance(tool_calls, (list, tuple)) and len(tool_calls) > 0:
+                from pihu_core.tools import tool_registry
+
+                messages.append({
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": getattr(tc, "id", f"call_{i}"),
+                            "type": "function",
+                            "function": {
+                                "name": getattr(getattr(tc, "function", None), "name", ""),
+                                "arguments": getattr(getattr(tc, "function", None), "arguments", "{}"),
+                            },
+                        }
+                        for i, tc in enumerate(tool_calls)
+                    ],
+                })
+
+                for tc in tool_calls:
+                    tc_id = getattr(tc, "id", "call_1")
+                    tc_func = getattr(tc, "function", None)
+                    tc_name = getattr(tc_func, "name", "") if tc_func else ""
+                    raw_args = getattr(tc_func, "arguments", "{}") if tc_func else "{}"
+                    if isinstance(raw_args, str):
+                        try:
+                            args_dict = json.loads(raw_args)
+                        except Exception:
+                            args_dict = {}
+                    elif isinstance(raw_args, dict):
+                        args_dict = raw_args
+                    else:
+                        args_dict = {}
+
+                    tool_result = tool_registry.execute(tc_name, **args_dict)
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc_id,
+                        "content": str(tool_result),
+                    })
+
+                call_kwargs["messages"] = messages
+                completion = client.chat.completions.create(**call_kwargs)
 
             reply_text = completion.choices[0].message.content or ""
             timestamp = datetime.now(timezone.utc).isoformat()
@@ -503,9 +675,10 @@ class GroqProvider(BaseProvider):
         message: str,
         history: Optional[List[Dict[str, str]]] = None,
         system_prompt: Optional[str] = None,
+        tools: Optional[List[Any]] = None,
         **kwargs: Any,
     ) -> Generator[StreamChunk, None, None]:
-        """Stream response tokens via Groq API."""
+        """Stream response tokens via Groq API with tool calling support."""
         if not self.is_available():
             raise RuntimeError("GROQ_API_KEY is not configured or groq SDK is unavailable.")
 
@@ -513,6 +686,93 @@ class GroqProvider(BaseProvider):
             client = Groq(api_key=Config.GROQ_API_KEY, timeout=kwargs.get("timeout", 30))
             messages = self._build_messages(message=message, history=history, system_prompt=system_prompt)
             temperature = kwargs.get("temperature", 0.7)
+
+            active_tools = tools
+            if active_tools is None and "tools" in kwargs:
+                active_tools = kwargs["tools"]
+            if active_tools is None:
+                from pihu_core.tools import tool_registry
+                active_tools = tool_registry.to_openai_format()
+
+            if active_tools:
+                probe_completion = client.chat.completions.create(
+                    model=self.model_name,
+                    messages=messages,
+                    temperature=temperature,
+                    tools=active_tools,
+                )
+                choices = getattr(probe_completion, "choices", None)
+                if choices and len(choices) > 0:
+                    msg_choice = choices[0].message
+                    tool_calls = getattr(msg_choice, "tool_calls", None)
+
+                    if isinstance(tool_calls, (list, tuple)) and len(tool_calls) > 0:
+                        from pihu_core.tools import tool_registry
+
+                        messages.append({
+                            "role": "assistant",
+                            "tool_calls": [
+                                {
+                                    "id": getattr(tc, "id", f"call_{i}"),
+                                    "type": "function",
+                                    "function": {
+                                        "name": getattr(getattr(tc, "function", None), "name", ""),
+                                        "arguments": getattr(getattr(tc, "function", None), "arguments", "{}"),
+                                    },
+                                }
+                                for i, tc in enumerate(tool_calls)
+                            ],
+                        })
+
+                        for tc in tool_calls:
+                            tc_id = getattr(tc, "id", "call_1")
+                            tc_func = getattr(tc, "function", None)
+                            tc_name = getattr(tc_func, "name", "") if tc_func else ""
+                            raw_args = getattr(tc_func, "arguments", "{}") if tc_func else "{}"
+                            if isinstance(raw_args, str):
+                                try:
+                                    args_dict = json.loads(raw_args)
+                                except Exception:
+                                    args_dict = {}
+                            elif isinstance(raw_args, dict):
+                                args_dict = raw_args
+                            else:
+                                args_dict = {}
+
+                            tool_result = tool_registry.execute(tc_name, **args_dict)
+                            messages.append({
+                                "role": "tool",
+                                "tool_call_id": tc_id,
+                                "content": str(tool_result),
+                            })
+
+                        stream = client.chat.completions.create(
+                            model=self.model_name,
+                            messages=messages,
+                            temperature=temperature,
+                            stream=True,
+                        )
+                        for chunk in stream:
+                            delta = chunk.choices[0].delta.content if chunk.choices and hasattr(chunk.choices[0], "delta") and hasattr(chunk.choices[0].delta, "content") else ""
+                            if delta:
+                                yield StreamChunk(text=delta, is_final=False)
+
+                        yield StreamChunk(text="", is_final=True)
+                        return
+                    else:
+                        content = getattr(msg_choice, "content", "") or ""
+                        if content:
+                            yield StreamChunk(text=content, is_final=False)
+                            yield StreamChunk(text="", is_final=True)
+                            return
+                elif hasattr(probe_completion, "__iter__") and not isinstance(probe_completion, (str, bytes, dict)):
+                    for chunk in probe_completion:
+                        delta = chunk.choices[0].delta.content if hasattr(chunk, "choices") and chunk.choices and hasattr(chunk.choices[0], "delta") and hasattr(chunk.choices[0].delta, "content") else ""
+                        if delta:
+                            yield StreamChunk(text=delta, is_final=False)
+
+                    yield StreamChunk(text="", is_final=True)
+                    return
 
             stream = client.chat.completions.create(
                 model=self.model_name,
@@ -522,7 +782,7 @@ class GroqProvider(BaseProvider):
             )
 
             for chunk in stream:
-                delta = chunk.choices[0].delta.content if chunk.choices else ""
+                delta = chunk.choices[0].delta.content if chunk.choices and hasattr(chunk.choices[0], "delta") and hasattr(chunk.choices[0].delta, "content") else ""
                 if delta:
                     yield StreamChunk(text=delta, is_final=False)
 
@@ -562,6 +822,7 @@ class HuggingFaceProvider(BaseProvider):
         message: str,
         history: Optional[List[Dict[str, str]]] = None,
         system_prompt: Optional[str] = None,
+        tools: Optional[List[Any]] = None,
         **kwargs: Any,
     ) -> ProviderResponse:
         if not self.is_available():
@@ -601,6 +862,7 @@ class OllamaProvider(BaseProvider):
         message: str,
         history: Optional[List[Dict[str, str]]] = None,
         system_prompt: Optional[str] = None,
+        tools: Optional[List[Any]] = None,
         **kwargs: Any,
     ) -> ProviderResponse:
         if not self.is_available():

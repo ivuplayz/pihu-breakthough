@@ -222,6 +222,78 @@ class TestStage4RepositoryAndProviders(unittest.TestCase):
             self.assertEqual(chunks[1].text, "stream!")
             self.assertTrue(chunks[2].is_final)
 
+    @patch("duckduckgo_search.DDGS")
+    @patch("pihu_core.providers.genai.Client")
+    def test_gemini_provider_tool_calling_loop(self, mock_client_cls: MagicMock, mock_ddgs_cls: MagicMock) -> None:
+        """GeminiProvider executes tool calling loop when LLM requests search_web."""
+        mock_ddgs_instance = MagicMock()
+        mock_ddgs_instance.text.return_value = [
+            {"title": "Latest AI News", "body": "Gemini 2.5 Flash released.", "href": "https://ai.google.dev"}
+        ]
+        mock_ddgs_cls.return_value = mock_ddgs_instance
+
+        mock_client = MagicMock()
+        # 1st response: function call to search_web
+        mock_tool_call_resp = MagicMock()
+        mock_fc = MagicMock()
+        mock_fc.name = "search_web"
+        mock_fc.args = {"query": "Gemini 2.5"}
+        mock_tool_call_resp.function_calls = [mock_fc]
+        mock_tool_call_resp.candidates = [MagicMock(content={"role": "model", "parts": []})]
+
+        # 2nd response: final grounded answer
+        mock_grounded_resp = MagicMock()
+        mock_grounded_resp.text = "Based on web search, Gemini 2.5 Flash is now available."
+        mock_grounded_resp.function_calls = None
+
+        mock_client.models.generate_content.side_effect = [mock_tool_call_resp, mock_grounded_resp]
+        mock_client_cls.return_value = mock_client
+
+        with patch.object(Config, "GEMINI_API_KEY", "mock-gemini-key"):
+            provider = GeminiProvider()
+            res = provider.generate(message="What's new in Gemini?")
+            self.assertEqual(res.content, "Based on web search, Gemini 2.5 Flash is now available.")
+            mock_ddgs_instance.text.assert_called_once_with("Gemini 2.5", max_results=5)
+            self.assertEqual(mock_client.models.generate_content.call_count, 2)
+
+    @patch("duckduckgo_search.DDGS")
+    @patch("pihu_core.providers.Groq")
+    def test_groq_provider_tool_calling_loop(self, mock_groq_cls: MagicMock, mock_ddgs_cls: MagicMock) -> None:
+        """GroqProvider executes tool calling loop when LLM requests search_web."""
+        mock_ddgs_instance = MagicMock()
+        mock_ddgs_instance.text.return_value = [
+            {"title": "Groq LPUs", "body": "Groq provides ultra-fast inference speed.", "href": "https://groq.com"}
+        ]
+        mock_ddgs_cls.return_value = mock_ddgs_instance
+
+        mock_client = MagicMock()
+        # 1st response: tool_calls requesting search_web
+        mock_completion_1 = MagicMock()
+        mock_choice_1 = MagicMock()
+        mock_tc = MagicMock()
+        mock_tc.id = "call_search_1"
+        mock_tc.function = MagicMock(name="search_web", arguments='{"query": "Groq speed"}')
+        mock_tc.function.name = "search_web"
+        mock_choice_1.message = MagicMock(tool_calls=[mock_tc], content=None)
+        mock_completion_1.choices = [mock_choice_1]
+
+        # 2nd response: grounded final response
+        mock_completion_2 = MagicMock()
+        mock_choice_2 = MagicMock()
+        mock_choice_2.message = MagicMock(tool_calls=None, content="Groq provides ultra-fast inference speeds via LPUs.")
+        mock_completion_2.choices = [mock_choice_2]
+        mock_completion_2.usage = MagicMock(prompt_tokens=20, completion_tokens=15, total_tokens=35)
+
+        mock_client.chat.completions.create.side_effect = [mock_completion_1, mock_completion_2]
+        mock_groq_cls.return_value = mock_client
+
+        with patch.object(Config, "GROQ_API_KEY", "mock-groq-key"):
+            provider = GroqProvider()
+            res = provider.generate(message="Tell me about Groq speed")
+            self.assertEqual(res.content, "Groq provides ultra-fast inference speeds via LPUs.")
+            mock_ddgs_instance.text.assert_called_once_with("Groq speed", max_results=5)
+            self.assertEqual(mock_client.chat.completions.create.call_count, 2)
+
     # --------------------------------------------------------------------------
     # 4. Overhauled POST /api/chat Workflow with Persistent Memory
     # --------------------------------------------------------------------------
@@ -234,7 +306,7 @@ class TestStage4RepositoryAndProviders(unittest.TestCase):
         mock_repo.get_messages.return_value = []
         mock_repo.save_message.return_value = {"id": str(uuid.uuid4())}
 
-        with patch("api.chat.conversation_repo", mock_repo):
+        with patch("api.chat.conversation_repo", mock_repo), patch.object(Config, "GEMINI_API_KEY", ""), patch.object(Config, "GROQ_API_KEY", ""):
             response = self.client.post(
                 "/api/chat",
                 data=json.dumps({"message": "Hello Pihu with memory"}),
@@ -267,7 +339,7 @@ class TestStage4RepositoryAndProviders(unittest.TestCase):
             {"role": "assistant", "content": "Previous answer"},
         ]
 
-        with patch("api.chat.conversation_repo", mock_repo):
+        with patch("api.chat.conversation_repo", mock_repo), patch.object(Config, "GEMINI_API_KEY", ""), patch.object(Config, "GROQ_API_KEY", ""):
             response = self.client.post(
                 "/api/chat",
                 data=json.dumps({"message": "Follow up question", "conversation_id": conv_uuid}),

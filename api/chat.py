@@ -6,11 +6,12 @@ backed by Neon PostgreSQL via ConversationRepository.
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any, Dict, List, Optional
 import uuid
 
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, jsonify, request, Response, stream_with_context
 from werkzeug.exceptions import HTTPException
 
 from pihu_core.config import Config
@@ -199,6 +200,16 @@ def post_chat() -> tuple[Any, int]:
             )
         strategy = data["strategy"].strip()
 
+    stream_requested = False
+    if "stream" in data and data["stream"] is not None:
+        if not isinstance(data["stream"], bool):
+            return _error_response(
+                code="INVALID_STREAM_TYPE",
+                message="The 'stream' field must be a boolean.",
+                status_code=400,
+            )
+        stream_requested = data["stream"]
+
     # 6. Conversation & Memory Resolution
     effective_history: List[Dict[str, str]] = []
     has_db = conversation_repo.is_available()
@@ -237,7 +248,62 @@ def post_chat() -> tuple[Any, int]:
             conversation_id = str(uuid.uuid4())
         effective_history = client_history or []
 
-    # 7. Execute Brain Routing
+    # 7. Execute Real-Time Streaming if requested
+    if stream_requested:
+        @stream_with_context
+        def generate_sse():
+            accumulated_chunks: List[str] = []
+            final_provider = provider_name or "gemini"
+
+            try:
+                for chunk_event in router.route_stream(
+                    message=clean_message,
+                    history=effective_history,
+                    strategy=strategy,
+                    provider_name=provider_name,
+                ):
+                    chunk_text = chunk_event.get("text", "")
+                    chunk_prov = chunk_event.get("provider", final_provider)
+                    final_provider = chunk_prov
+                    if chunk_text:
+                        accumulated_chunks.append(chunk_text)
+
+                    event_payload = {
+                        "chunk": chunk_text,
+                        "provider": chunk_prov,
+                    }
+                    yield f"data: {json.dumps(event_payload)}\n\n"
+
+            except Exception as exc:
+                logger.exception("Error during SSE streaming: %s", exc)
+                error_payload = {
+                    "chunk": f"\n[Streaming error: {exc}]",
+                    "provider": final_provider,
+                    "error": True,
+                }
+                yield f"data: {json.dumps(error_payload)}\n\n"
+
+            finally:
+                full_text = "".join(accumulated_chunks)
+                if has_db and conversation_id and full_text:
+                    try:
+                        conversation_repo.save_message(
+                            conversation_id=conversation_id,
+                            role="assistant",
+                            content=full_text,
+                            provider_used=final_provider,
+                        )
+                        logger.info(
+                            "Persisted full streamed assistant message (%d chars) for conversation '%s'.",
+                            len(full_text),
+                            conversation_id,
+                        )
+                    except Exception as save_err:
+                        logger.warning("Failed to persist streamed assistant response: %s", save_err)
+
+        return Response(generate_sse(), mimetype="text/event-stream")
+
+    # 8. Execute Brain Routing (Synchronous Atomic Flow)
     try:
         result = router.route_chat(
             message=clean_message,
