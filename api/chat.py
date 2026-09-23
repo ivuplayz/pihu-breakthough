@@ -16,6 +16,7 @@ import uuid
 from flask import Blueprint, jsonify, request, Response, stream_with_context
 from werkzeug.exceptions import HTTPException
 
+from pihu_core.audio import audio_transcriber, AudioTranscriptionError
 from pihu_core.config import Config
 from pihu_core.repository import conversation_repo
 from pihu_core.router import router
@@ -93,38 +94,101 @@ def post_chat() -> tuple[Any, int]:
             status_code=400,
         )
 
-    # 2. 'message' field presence and type validation
-    if "message" not in data:
-        return _error_response(
-            code="MISSING_MESSAGE",
-            message="The 'message' field is required.",
-            status_code=400,
-        )
+    # 2. Optional 'audio' speech-to-text processing (Groq Whisper)
+    has_audio = False
+    transcribed_text: Optional[str] = None
+    if "audio" in data and data["audio"] is not None:
+        raw_audio = data["audio"]
+        if not isinstance(raw_audio, dict):
+            return _error_response(
+                code="INVALID_AUDIO_TYPE",
+                message="The 'audio' field must be an object with 'data' and optional 'mime_type'.",
+                status_code=400,
+            )
 
-    message = data["message"]
-    if not isinstance(message, str):
+        if "data" not in raw_audio:
+            return _error_response(
+                code="MISSING_AUDIO_DATA",
+                message="The 'audio' object must contain a 'data' field.",
+                status_code=400,
+            )
+
+        audio_b64 = raw_audio["data"]
+        if not isinstance(audio_b64, str):
+            return _error_response(
+                code="INVALID_AUDIO_DATA",
+                message="The 'audio.data' field must be a base64-encoded string.",
+                status_code=400,
+            )
+
+        audio_mime = raw_audio.get("mime_type", "audio/webm")
+        if not isinstance(audio_mime, str):
+            return _error_response(
+                code="INVALID_AUDIO_MIME_TYPE",
+                message="The 'audio.mime_type' field must be a string.",
+                status_code=400,
+            )
+
+        try:
+            transcribed_text = audio_transcriber.transcribe(
+                audio_data=audio_b64,
+                mime_type=audio_mime,
+            )
+            has_audio = True
+        except AudioTranscriptionError as a_err:
+            logger.warning("Audio transcription failed: %s", a_err)
+            return _error_response(
+                code="AUDIO_TRANSCRIPTION_FAILED",
+                message=f"Voice transcription failed: {a_err}",
+                status_code=400,
+            )
+        except Exception as exc:
+            logger.error("Unexpected audio transcription error: %s", exc)
+            return _error_response(
+                code="AUDIO_TRANSCRIPTION_FAILED",
+                message=f"Voice transcription failed unexpectedly: {exc}",
+                status_code=400,
+            )
+
+    # 3. 'message' field resolution & validation
+    raw_message = data.get("message")
+    if raw_message is not None and not isinstance(raw_message, str):
         return _error_response(
             code="INVALID_MESSAGE_TYPE",
             message="The 'message' field must be a string.",
             status_code=400,
         )
 
-    clean_message = message.strip()
+    clean_message = raw_message.strip() if isinstance(raw_message, str) else ""
+
+    # Inject or combine transcribed audio text into message
+    if has_audio and transcribed_text:
+        if clean_message:
+            clean_message = f"{clean_message} {transcribed_text}".strip()
+        else:
+            clean_message = transcribed_text
+
     if not clean_message:
+        if "message" not in data and not has_audio:
+            return _error_response(
+                code="MISSING_MESSAGE",
+                message="The 'message' field is required.",
+                status_code=400,
+            )
         return _error_response(
             code="EMPTY_MESSAGE",
             message="The 'message' field cannot be empty or contain only whitespace.",
             status_code=400,
         )
 
-    if len(message) > MAX_MESSAGE_LENGTH:
+    if len(clean_message) > MAX_MESSAGE_LENGTH:
         return _error_response(
             code="MESSAGE_TOO_LONG",
             message=f"Message exceeds maximum allowed length of {MAX_MESSAGE_LENGTH} characters.",
             status_code=400,
         )
 
-    # 3. 'conversation_id' validation (optional)
+    # 4. 'conversation_id' validation (optional)
     conversation_id = data.get("conversation_id")
     if conversation_id is not None and not isinstance(conversation_id, str):
         return _error_response(
@@ -434,10 +498,12 @@ def post_chat() -> tuple[Any, int]:
 
             # Save incoming User message to database
             user_db_content = clean_message
+            if has_audio:
+                user_db_content = f"[🎤 Voice Message] {user_db_content}"
             if validated_images:
                 num_imgs = len(validated_images)
                 tag = f"[Attached {num_imgs} Image{'s' if num_imgs > 1 else ''}]"
-                user_db_content = f"{clean_message} {tag}"
+                user_db_content = f"{user_db_content} {tag}"
 
             conversation_repo.save_message(
                 conversation_id=conversation_id,
@@ -532,6 +598,10 @@ def post_chat() -> tuple[Any, int]:
 
         ai_response = result["response"]
         active_provider = result["provider"]
+
+        if has_audio:
+            result["metadata"]["audio_transcribed"] = True
+            result["metadata"]["transcription"] = transcribed_text
 
         # Save AI Response to database if available
         if has_db and conversation_id:
