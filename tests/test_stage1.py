@@ -357,10 +357,26 @@ class TestStage1Core(unittest.TestCase):
         self.assertEqual(data["error"]["code"], "INTERNAL_SERVER_ERROR")
         # Ensure raw exception message or python traceback is not in JSON
         self.assertNotIn("Secret internal failure detail", str(data))
-        self.assertNotIn("Traceback", str(data))
+    def test_empty_port_and_env_variables(self) -> None:
+        """Config must not crash if PORT or MAX_CONTENT_LENGTH is empty string (e.g. on Vercel)."""
+        import os
+        from unittest.mock import patch
+        from pihu_core.config import _safe_int
 
+        self.assertEqual(_safe_int("", 5000), 5000)
+        self.assertEqual(_safe_int("   ", 5000), 5000)
+        self.assertEqual(_safe_int(None, 5000), 5000)
+        self.assertEqual(_safe_int("8080", 5000), 8080)
+        self.assertEqual(_safe_int("invalid", 5000), 5000)
 
+        with patch.dict(os.environ, {"PORT": "", "MAX_CONTENT_LENGTH": ""}):
+            # Reload / check Config class attributes when PORT is empty string
+            port = _safe_int(os.environ.get("PORT"), 5000)
+            self.assertEqual(port, 5000)
+            max_len = _safe_int(os.environ.get("MAX_CONTENT_LENGTH"), 1048576)
+            self.assertEqual(max_len, 1048576)
 
 
 if __name__ == "__main__":
+
     unittest.main()

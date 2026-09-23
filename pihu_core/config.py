@@ -18,6 +18,16 @@ except ImportError:
     pass
 
 
+def _safe_int(val: str | None, default: int) -> int:
+    """Safely parse integer environment variable, defaulting if unset or empty."""
+    if not val or not val.strip():
+        return default
+    try:
+        return int(val.strip())
+    except (ValueError, TypeError):
+        return default
+
+
 class Config:
     """Application configuration for Pihu-BreakThough."""
 
@@ -26,17 +36,18 @@ class Config:
     STAGE: str = "Stage 1"
 
     # Server settings
-    ENV: str = os.getenv("FLASK_ENV", "production")
-    DEBUG: bool = os.getenv("FLASK_DEBUG", "0").lower() in ("1", "true", "yes")
-    PORT: int = int(os.getenv("PORT", "5000"))
-    SECRET_KEY: str = os.getenv(
-        "SECRET_KEY", "pihu-breakthough-dev-insecure-secret-key"
+    ENV: str = os.getenv("FLASK_ENV") or "production"
+    DEBUG: bool = (os.getenv("FLASK_DEBUG") or "0").lower() in ("1", "true", "yes")
+    PORT: int = _safe_int(os.getenv("PORT"), 5000)
+    SECRET_KEY: str = (
+        os.getenv("SECRET_KEY") or "pihu-breakthough-dev-insecure-secret-key"
     )
 
     # Maximum payload size (1 MB default)
-    MAX_CONTENT_LENGTH: int = int(
-        os.getenv("MAX_CONTENT_LENGTH", str(1 * 1024 * 1024))
+    MAX_CONTENT_LENGTH: int = _safe_int(
+        os.getenv("MAX_CONTENT_LENGTH"), 1 * 1024 * 1024
     )
+
 
     # Database settings (Neon PostgreSQL) - Optional in Stage 1
     DATABASE_URL: str | None = os.getenv("DATABASE_URL")
