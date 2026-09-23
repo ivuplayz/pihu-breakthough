@@ -8,6 +8,7 @@ Actual network execution to external vendor APIs is reserved for Stage 4.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+import base64
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -28,6 +29,7 @@ class IntentType(str, Enum):
     COMPLEX_REASONING = "complex_reasoning"
     CODING_SYSTEM = "coding_system"
     SUMMARIZATION = "summarization"
+    MULTIMODAL = "multimodal"
     LOCAL_PRIVATE = "local_private"
     FALLBACK_SAFE = "fallback_safe"
 
@@ -39,6 +41,7 @@ class RoutingStrategy(str, Enum):
     LOW_LATENCY = "low_latency"
     HIGH_QUALITY = "high_quality"
     SUMMARIZATION = "summarization"
+    VISION = "vision"
     OFFLINE_ONLY = "offline_only"
     MANUAL = "manual"
 
@@ -58,6 +61,7 @@ class ProviderCapabilities:
 
     supports_streaming: bool = True
     supports_tools: bool = False
+    supports_vision: bool = False
     max_context_tokens: int = 8192
     typical_latency_ms: int = 500
     is_local: bool = False
@@ -67,6 +71,7 @@ class ProviderCapabilities:
         return {
             "supports_streaming": self.supports_streaming,
             "supports_tools": self.supports_tools,
+            "supports_vision": self.supports_vision,
             "max_context_tokens": self.max_context_tokens,
             "typical_latency_ms": self.typical_latency_ms,
             "is_local": self.is_local,
@@ -152,6 +157,7 @@ class BaseProvider(ABC):
         history: Optional[List[Dict[str, str]]] = None,
         system_prompt: Optional[str] = None,
         tools: Optional[List[Any]] = None,
+        images: Optional[List[Dict[str, Any]]] = None,
         **kwargs: Any,
     ) -> ProviderResponse:
         """Generate a complete synchronous response."""
@@ -163,6 +169,7 @@ class BaseProvider(ABC):
         history: Optional[List[Dict[str, str]]] = None,
         system_prompt: Optional[str] = None,
         tools: Optional[List[Any]] = None,
+        images: Optional[List[Dict[str, Any]]] = None,
         **kwargs: Any,
     ) -> Generator[StreamChunk, None, None]:
         """Generate response tokens as a stream.
@@ -174,6 +181,7 @@ class BaseProvider(ABC):
             history=history,
             system_prompt=system_prompt,
             tools=tools,
+            images=images,
             **kwargs,
         )
         yield StreamChunk(
@@ -216,14 +224,17 @@ class Stage1DeterministicProvider(BaseProvider):
         history: Optional[List[Dict[str, str]]] = None,
         system_prompt: Optional[str] = None,
         tools: Optional[List[Any]] = None,
+        images: Optional[List[Dict[str, Any]]] = None,
         **kwargs: Any,
     ) -> ProviderResponse:
         history_len = len(history) if history else 0
+        img_len = len(images) if images else 0
         timestamp = datetime.now(timezone.utc).isoformat()
 
+        img_annotation = f" with {img_len} attached image(s)" if img_len > 0 else ""
         reply = (
             f"Pihu-BreakThough Stage 1 Core is operational. "
-            f"Received message ({len(message)} chars): \"{message.strip()}\". "
+            f"Received message ({len(message)} chars): \"{message.strip()}\"{img_annotation}. "
             f"History context contains {history_len} items."
         )
 
@@ -234,6 +245,7 @@ class Stage1DeterministicProvider(BaseProvider):
             metadata={
                 "received_chars": len(message),
                 "history_length": history_len,
+                "image_count": img_len,
                 "timestamp": timestamp,
                 "stage": Config.STAGE,
             },
@@ -245,6 +257,7 @@ class Stage1DeterministicProvider(BaseProvider):
         history: Optional[List[Dict[str, str]]] = None,
         system_prompt: Optional[str] = None,
         tools: Optional[List[Any]] = None,
+        images: Optional[List[Dict[str, Any]]] = None,
         **kwargs: Any,
     ) -> Generator[StreamChunk, None, None]:
         resp = self.generate(
@@ -252,6 +265,7 @@ class Stage1DeterministicProvider(BaseProvider):
             history=history,
             system_prompt=system_prompt,
             tools=tools,
+            images=images,
             **kwargs,
         )
         words = resp.content.split(" ")
@@ -309,6 +323,7 @@ class GeminiProvider(BaseProvider):
         return ProviderCapabilities(
             supports_streaming=True,
             supports_tools=True,
+            supports_vision=True,
             max_context_tokens=1048576,
             typical_latency_ms=450,
             is_local=False,
@@ -322,8 +337,9 @@ class GeminiProvider(BaseProvider):
         self,
         message: str,
         history: Optional[List[Dict[str, str]]] = None,
+        images: Optional[List[Dict[str, Any]]] = None,
     ) -> List[Dict[str, Any]]:
-        """Map standard chat history to Gemini contents structure."""
+        """Map standard chat history and multimodal parts to Gemini contents structure."""
         contents: List[Dict[str, Any]] = []
         if history:
             for item in history:
@@ -332,7 +348,35 @@ class GeminiProvider(BaseProvider):
                 content_text = item.get("content", "")
                 contents.append({"role": role, "parts": [{"text": content_text}]})
 
-        contents.append({"role": "user", "parts": [{"text": message}]})
+        user_parts: List[Any] = []
+        if images:
+            for img in images:
+                if not isinstance(img, dict):
+                    continue
+                mime_type = img.get("mime_type", "image/jpeg")
+                b64_data = img.get("data", "")
+                if not b64_data:
+                    continue
+                if "," in b64_data:
+                    b64_data = b64_data.split(",", 1)[1]
+                try:
+                    raw_bytes = base64.b64decode(b64_data)
+                except Exception as b64_err:
+                    logger.warning("Failed to decode base64 image data: %s", b64_err)
+                    continue
+
+                if types and hasattr(types, "Part") and hasattr(types.Part, "from_bytes"):
+                    user_parts.append(types.Part.from_bytes(data=raw_bytes, mime_type=mime_type))
+                else:
+                    user_parts.append({
+                        "inline_data": {
+                            "mime_type": mime_type,
+                            "data": b64_data,
+                        }
+                    })
+
+        user_parts.append({"text": message})
+        contents.append({"role": "user", "parts": user_parts})
         return contents
 
     def generate(
@@ -341,6 +385,7 @@ class GeminiProvider(BaseProvider):
         history: Optional[List[Dict[str, str]]] = None,
         system_prompt: Optional[str] = None,
         tools: Optional[List[Any]] = None,
+        images: Optional[List[Dict[str, Any]]] = None,
         **kwargs: Any,
     ) -> ProviderResponse:
         """Generate response via Google Gemini API using google-genai SDK."""
@@ -349,7 +394,7 @@ class GeminiProvider(BaseProvider):
 
         try:
             client = genai.Client(api_key=Config.GEMINI_API_KEY)
-            contents = self._build_contents(message=message, history=history)
+            contents = self._build_contents(message=message, history=history, images=images)
             timeout = kwargs.get("timeout", 30)
 
             active_tools = tools
@@ -436,6 +481,7 @@ class GeminiProvider(BaseProvider):
         history: Optional[List[Dict[str, str]]] = None,
         system_prompt: Optional[str] = None,
         tools: Optional[List[Any]] = None,
+        images: Optional[List[Dict[str, Any]]] = None,
         **kwargs: Any,
     ) -> Generator[StreamChunk, None, None]:
         """Stream response tokens via Google Gemini API using google-genai SDK."""
@@ -444,7 +490,7 @@ class GeminiProvider(BaseProvider):
 
         try:
             client = genai.Client(api_key=Config.GEMINI_API_KEY)
-            contents = self._build_contents(message=message, history=history)
+            contents = self._build_contents(message=message, history=history, images=images)
             timeout = kwargs.get("timeout", 30)
 
             active_tools = tools
@@ -579,6 +625,7 @@ class GroqProvider(BaseProvider):
         history: Optional[List[Dict[str, str]]] = None,
         system_prompt: Optional[str] = None,
         tools: Optional[List[Any]] = None,
+        images: Optional[List[Dict[str, Any]]] = None,
         **kwargs: Any,
     ) -> ProviderResponse:
         """Generate response via Groq API with tool calling support."""
@@ -685,6 +732,7 @@ class GroqProvider(BaseProvider):
         history: Optional[List[Dict[str, str]]] = None,
         system_prompt: Optional[str] = None,
         tools: Optional[List[Any]] = None,
+        images: Optional[List[Dict[str, Any]]] = None,
         **kwargs: Any,
     ) -> Generator[StreamChunk, None, None]:
         """Stream response tokens via Groq API with tool calling support."""
@@ -860,6 +908,7 @@ class HuggingFaceProvider(BaseProvider):
         history: Optional[List[Dict[str, str]]] = None,
         system_prompt: Optional[str] = None,
         tools: Optional[List[Any]] = None,
+        images: Optional[List[Dict[str, Any]]] = None,
         **kwargs: Any,
     ) -> ProviderResponse:
         """Generate response via Hugging Face Serverless Inference API."""
@@ -913,6 +962,7 @@ class HuggingFaceProvider(BaseProvider):
         history: Optional[List[Dict[str, str]]] = None,
         system_prompt: Optional[str] = None,
         tools: Optional[List[Any]] = None,
+        images: Optional[List[Dict[str, Any]]] = None,
         **kwargs: Any,
     ) -> Generator[StreamChunk, None, None]:
         """Stream response tokens via Hugging Face Serverless Inference API."""
@@ -979,6 +1029,7 @@ class OllamaProvider(BaseProvider):
         history: Optional[List[Dict[str, str]]] = None,
         system_prompt: Optional[str] = None,
         tools: Optional[List[Any]] = None,
+        images: Optional[List[Dict[str, Any]]] = None,
         **kwargs: Any,
     ) -> ProviderResponse:
         if not self.is_available():

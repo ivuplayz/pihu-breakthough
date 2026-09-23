@@ -76,11 +76,14 @@ class ProviderCircuitBreaker:
         return False
 
 
-def classify_intent(message: str) -> IntentType:
+def classify_intent(message: str, has_images: bool = False) -> IntentType:
     """High-throughput heuristic classifier mapping prompts to IntentType.
 
     Avoids latency overhead from auxiliary classification models.
     """
+    if has_images:
+        return IntentType.MULTIMODAL
+
     if not message:
         return IntentType.FALLBACK_SAFE
 
@@ -186,8 +189,14 @@ class ProviderRouter:
                     candidates.append(self._providers[name])
             return candidates
 
+        # Vision Strategy or Multimodal Intent
+        if strategy == RoutingStrategy.VISION or intent == IntentType.MULTIMODAL:
+            # Frontier vision model Gemini prioritized as Tier 1
+            if "gemini" in self._providers and self._providers["gemini"] not in candidates:
+                candidates.insert(0, self._providers["gemini"])
+            order = ("gemini", "groq", "huggingface", "stage1-deterministic")
         # Summarization Strategy or Intent
-        if strategy == RoutingStrategy.SUMMARIZATION or intent == IntentType.SUMMARIZATION:
+        elif strategy == RoutingStrategy.SUMMARIZATION or intent == IntentType.SUMMARIZATION:
             order = ("huggingface", "gemini", "groq", "stage1-deterministic")
         # Low Latency Strategy or Fast Chat
         elif strategy == RoutingStrategy.LOW_LATENCY or intent == IntentType.FAST_CHAT:
@@ -214,6 +223,7 @@ class ProviderRouter:
         strategy: str | RoutingStrategy = RoutingStrategy.AUTO,
         provider_name: Optional[str] = None,
         system_prompt: Optional[str] = None,
+        images: Optional[List[Dict[str, Any]]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         """Route chat prompt across multi-tier hierarchy with transparent fallback.
@@ -221,14 +231,16 @@ class ProviderRouter:
         Args:
             message: User query string.
             history: Optional list of previous chat messages.
-            strategy: Routing strategy (auto, low_latency, high_quality, offline_only, manual).
+            strategy: Routing strategy (auto, low_latency, high_quality, summarization, vision, offline_only, manual).
             provider_name: Optional explicit provider hint.
             system_prompt: Optional system personality/instruction string.
+            images: Optional list of base64-encoded image payloads.
 
         Returns:
             Normalized dictionary containing response content and execution metadata.
         """
         start_time = time.time()
+        has_images = bool(images)
 
         # Parse routing strategy
         if isinstance(strategy, str):
@@ -239,7 +251,10 @@ class ProviderRouter:
         else:
             parsed_strategy = strategy
 
-        intent = classify_intent(message)
+        if has_images and parsed_strategy == RoutingStrategy.AUTO:
+            parsed_strategy = RoutingStrategy.VISION
+
+        intent = classify_intent(message, has_images=has_images)
         chain = self.resolve_provider_chain(
             intent=intent,
             strategy=parsed_strategy,
@@ -268,6 +283,7 @@ class ProviderRouter:
                     message=message,
                     history=history,
                     system_prompt=system_prompt,
+                    images=images,
                     **kwargs,
                 )
                 cb.record_success()
@@ -291,6 +307,7 @@ class ProviderRouter:
                 message=message,
                 history=history,
                 system_prompt=system_prompt,
+                images=images,
                 **kwargs,
             )
             selected_provider = fallback
@@ -307,6 +324,9 @@ class ProviderRouter:
             "fallback_chain": attempted_chain,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
+        if has_images:
+            combined_metadata["has_images"] = True
+            combined_metadata["image_count"] = len(images) if images else 0
 
         return {
             "ok": True,
@@ -324,10 +344,12 @@ class ProviderRouter:
         strategy: str | RoutingStrategy = RoutingStrategy.AUTO,
         provider_name: Optional[str] = None,
         system_prompt: Optional[str] = None,
+        images: Optional[List[Dict[str, Any]]] = None,
         **kwargs: Any,
     ) -> Generator[Dict[str, Any], None, None]:
         """Route chat prompt yielding streaming chunks with transparent fallback."""
         start_time = time.time()
+        has_images = bool(images)
 
         if isinstance(strategy, str):
             try:
@@ -337,7 +359,10 @@ class ProviderRouter:
         else:
             parsed_strategy = strategy
 
-        intent = classify_intent(message)
+        if has_images and parsed_strategy == RoutingStrategy.AUTO:
+            parsed_strategy = RoutingStrategy.VISION
+
+        intent = classify_intent(message, has_images=has_images)
         chain = self.resolve_provider_chain(
             intent=intent,
             strategy=parsed_strategy,
@@ -354,6 +379,7 @@ class ProviderRouter:
                     message=message,
                     history=history,
                     system_prompt=system_prompt,
+                    images=images,
                     **kwargs,
                 ):
                     yield {
@@ -377,6 +403,7 @@ class ProviderRouter:
             message=message,
             history=history,
             system_prompt=system_prompt,
+            images=images,
             **kwargs,
         ):
             yield {

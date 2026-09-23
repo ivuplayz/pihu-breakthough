@@ -43,9 +43,9 @@ class Config:
         os.getenv("SECRET_KEY") or "pihu-breakthough-dev-insecure-secret-key"
     )
 
-    # Maximum payload size (1 MB default)
+    # Maximum payload size (16 MB default to accommodate multimodal image payloads)
     MAX_CONTENT_LENGTH: int = _safe_int(
-        os.getenv("MAX_CONTENT_LENGTH"), 1 * 1024 * 1024
+        os.getenv("MAX_CONTENT_LENGTH"), 16 * 1024 * 1024
     )
 
 

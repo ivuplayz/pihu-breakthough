@@ -6,9 +6,11 @@ backed by Neon PostgreSQL via ConversationRepository.
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 from typing import Any, Dict, List, Optional
+import urllib.request
 import uuid
 
 from flask import Blueprint, jsonify, request, Response, stream_with_context
@@ -179,7 +181,181 @@ def post_chat() -> tuple[Any, int]:
 
         client_history = sanitized_history
 
-    # 5. Optional parameters (provider hint, strategy)
+    # 5. 'images' validation (optional multimodal vision payloads)
+    validated_images: Optional[List[Dict[str, Any]]] = None
+    if "images" in data and data["images"] is not None:
+        raw_images = data["images"]
+        if not isinstance(raw_images, list):
+            return _error_response(
+                code="INVALID_IMAGES_TYPE",
+                message="The 'images' field must be an array of image objects.",
+                status_code=400,
+            )
+
+        if len(raw_images) > 3:
+            return _error_response(
+                code="TOO_MANY_IMAGES",
+                message="Maximum of 3 images allowed per request.",
+                status_code=400,
+            )
+
+        SUPPORTED_IMAGE_MIMES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
+        MAX_IMAGE_BYTES = 5 * 1024 * 1024  # 5MB per image
+
+        processed_images: List[Dict[str, Any]] = []
+
+        for idx, img_item in enumerate(raw_images):
+            if not isinstance(img_item, dict):
+                return _error_response(
+                    code="INVALID_IMAGE_ITEM",
+                    message=f"Image item at index {idx} must be an object.",
+                    status_code=400,
+                )
+
+            b64_str: Optional[str] = None
+            mime_type: Optional[str] = img_item.get("mime_type")
+
+            # Check for URL format (data URI or remote URL)
+            if "url" in img_item and img_item["url"] is not None:
+                url_val = img_item["url"]
+                if not isinstance(url_val, str):
+                    return _error_response(
+                        code="INVALID_IMAGE_URL",
+                        message=f"Image 'url' at index {idx} must be a string.",
+                        status_code=400,
+                    )
+                url_clean = url_val.strip()
+                if url_clean.startswith("data:"):
+                    try:
+                        header, b64_part = url_clean.split(",", 1)
+                        b64_str = b64_part
+                        if ";base64" in header:
+                            extracted_mime = header.split(":", 1)[1].split(";", 1)[0]
+                            if not mime_type:
+                                mime_type = extracted_mime
+                    except Exception:
+                        return _error_response(
+                            code="INVALID_DATA_URI",
+                            message=f"Image at index {idx} contains a malformed data URI.",
+                            status_code=400,
+                        )
+                elif url_clean.startswith("http://") or url_clean.startswith("https://"):
+                    try:
+                        req = urllib.request.Request(
+                            url_clean,
+                            headers={"User-Agent": "Pihu-BreakThough/1.0"},
+                        )
+                        with urllib.request.urlopen(req, timeout=5) as resp:
+                            fetched_bytes = resp.read(MAX_IMAGE_BYTES + 1)
+                            if len(fetched_bytes) > MAX_IMAGE_BYTES:
+                                return _error_response(
+                                    code="IMAGE_TOO_LARGE",
+                                    message=f"Image fetched from URL at index {idx} exceeds 5MB limit.",
+                                    status_code=400,
+                                )
+                            b64_str = base64.b64encode(fetched_bytes).decode("utf-8")
+                            content_type = resp.headers.get_content_type()
+                            if not mime_type and content_type:
+                                mime_type = content_type
+                    except Exception as url_err:
+                        return _error_response(
+                            code="IMAGE_FETCH_FAILED",
+                            message=f"Failed to fetch image from URL at index {idx}: {url_err}",
+                            status_code=400,
+                        )
+                else:
+                    return _error_response(
+                        code="INVALID_IMAGE_URL",
+                        message=f"Image URL at index {idx} must be a valid http(s) URL or data URI.",
+                        status_code=400,
+                    )
+            elif "data" in img_item:
+                raw_data = img_item["data"]
+                if not isinstance(raw_data, str):
+                    return _error_response(
+                        code="INVALID_IMAGE_DATA",
+                        message=f"Image 'data' at index {idx} must be a base64-encoded string.",
+                        status_code=400,
+                    )
+                clean_data = raw_data.strip()
+                if clean_data.startswith("data:"):
+                    try:
+                        header, b64_part = clean_data.split(",", 1)
+                        b64_str = b64_part
+                        if ";base64" in header:
+                            extracted_mime = header.split(":", 1)[1].split(";", 1)[0]
+                            if not mime_type:
+                                mime_type = extracted_mime
+                    except Exception:
+                        return _error_response(
+                            code="INVALID_DATA_URI",
+                            message=f"Image at index {idx} contains a malformed data URI.",
+                            status_code=400,
+                        )
+                else:
+                    b64_str = clean_data
+            else:
+                return _error_response(
+                    code="MISSING_IMAGE_PAYLOAD",
+                    message=f"Image item at index {idx} must provide 'data' or 'url'.",
+                    status_code=400,
+                )
+
+            if not b64_str:
+                return _error_response(
+                    code="EMPTY_IMAGE_DATA",
+                    message=f"Image data at index {idx} cannot be empty.",
+                    status_code=400,
+                )
+
+            if not mime_type or not isinstance(mime_type, str):
+                return _error_response(
+                    code="MISSING_IMAGE_MIME_TYPE",
+                    message=f"Image item at index {idx} must have a valid 'mime_type'.",
+                    status_code=400,
+                )
+
+            clean_mime = mime_type.strip().lower()
+            if clean_mime not in SUPPORTED_IMAGE_MIMES:
+                return _error_response(
+                    code="UNSUPPORTED_IMAGE_MIME_TYPE",
+                    message=f"Unsupported image MIME type '{clean_mime}'. Supported formats: {sorted(list(SUPPORTED_IMAGE_MIMES))}.",
+                    status_code=400,
+                )
+
+            # Validate base64 encoding and size limit
+            try:
+                decoded_bytes = base64.b64decode(b64_str, validate=True)
+            except Exception:
+                return _error_response(
+                    code="INVALID_BASE64_IMAGE",
+                    message=f"Image data at index {idx} is not valid base64.",
+                    status_code=400,
+                )
+
+            if len(decoded_bytes) == 0:
+                return _error_response(
+                    code="EMPTY_IMAGE_DATA",
+                    message=f"Decoded image data at index {idx} is empty.",
+                    status_code=400,
+                )
+
+            if len(decoded_bytes) > MAX_IMAGE_BYTES:
+                return _error_response(
+                    code="IMAGE_TOO_LARGE",
+                    message=f"Image at index {idx} exceeds maximum allowed size of 5MB.",
+                    status_code=400,
+                )
+
+            processed_images.append({
+                "data": b64_str,
+                "mime_type": clean_mime,
+            })
+
+        if processed_images:
+            validated_images = processed_images
+
+    # 6. Optional parameters (provider hint, strategy)
     provider_name: Optional[str] = None
     if "provider" in data and data["provider"] is not None:
         if not isinstance(data["provider"], str):
@@ -257,10 +433,16 @@ def post_chat() -> tuple[Any, int]:
                     )
 
             # Save incoming User message to database
+            user_db_content = clean_message
+            if validated_images:
+                num_imgs = len(validated_images)
+                tag = f"[Attached {num_imgs} Image{'s' if num_imgs > 1 else ''}]"
+                user_db_content = f"{clean_message} {tag}"
+
             conversation_repo.save_message(
                 conversation_id=conversation_id,
                 role="user",
-                content=clean_message,
+                content=user_db_content,
             )
         except Exception as exc:
             logger.warning("Database conversation resolution failed: %s. Continuing with client memory.", exc)
@@ -294,6 +476,7 @@ def post_chat() -> tuple[Any, int]:
                     strategy=strategy,
                     provider_name=provider_name,
                     system_prompt=system_prompt,
+                    images=validated_images,
                 ):
                     chunk_text = chunk_event.get("text", "")
                     chunk_prov = chunk_event.get("provider", final_provider)
@@ -344,6 +527,7 @@ def post_chat() -> tuple[Any, int]:
             strategy=strategy,
             provider_name=provider_name,
             system_prompt=system_prompt,
+            images=validated_images,
         )
 
         ai_response = result["response"]
