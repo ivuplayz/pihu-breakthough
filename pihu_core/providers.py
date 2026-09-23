@@ -248,10 +248,12 @@ class Stage1DeterministicProvider(BaseProvider):
 
 # Safe imports for AI vendor SDKs
 try:
-    import google.generativeai as genai
+    from google import genai
+    from google.genai import types
     GENAI_AVAILABLE = True
 except ImportError:
     genai = None  # type: ignore
+    types = None  # type: ignore
     GENAI_AVAILABLE = False
 
 try:
@@ -263,7 +265,7 @@ except ImportError:
 
 
 class GeminiProvider(BaseProvider):
-    """Google Gemini provider (Tier 1 Primary Frontier Engine) using google.generativeai SDK."""
+    """Google Gemini provider (Tier 1 Primary Frontier Engine) using official google-genai SDK."""
 
     def __init__(self, model_name: str = "gemini-2.5-flash") -> None:
         self._model_name = model_name
@@ -302,9 +304,9 @@ class GeminiProvider(BaseProvider):
                 # Gemini roles are 'user' and 'model'
                 role = "model" if item.get("role") in ("assistant", "model") else "user"
                 content_text = item.get("content", "")
-                contents.append({"role": role, "parts": [content_text]})
+                contents.append({"role": role, "parts": [{"text": content_text}]})
 
-        contents.append({"role": "user", "parts": [message]})
+        contents.append({"role": "user", "parts": [{"text": message}]})
         return contents
 
     def generate(
@@ -314,24 +316,29 @@ class GeminiProvider(BaseProvider):
         system_prompt: Optional[str] = None,
         **kwargs: Any,
     ) -> ProviderResponse:
-        """Generate response via Google Gemini API."""
+        """Generate response via Google Gemini API using google-genai SDK."""
         if not self.is_available():
-            raise RuntimeError("GEMINI_API_KEY is not configured or google.generativeai SDK is unavailable.")
+            raise RuntimeError("GEMINI_API_KEY is not configured or google-genai SDK is unavailable.")
 
         try:
-            genai.configure(api_key=Config.GEMINI_API_KEY)
-            model_kwargs: Dict[str, Any] = {}
-            if system_prompt:
-                model_kwargs["system_instruction"] = system_prompt
-
-            model = genai.GenerativeModel(self.model_name, **model_kwargs)
+            client = genai.Client(api_key=Config.GEMINI_API_KEY)
             contents = self._build_contents(message=message, history=history)
             timeout = kwargs.get("timeout", 30)
 
-            response = model.generate_content(
-                contents,
-                request_options={"timeout": timeout},
-            )
+            config = None
+            config_kwargs: Dict[str, Any] = {}
+            if system_prompt:
+                config_kwargs["system_instruction"] = system_prompt
+            if timeout and types:
+                config_kwargs["http_options"] = types.HttpOptions(timeout=timeout)
+            if config_kwargs and types:
+                config = types.GenerateContentConfig(**config_kwargs)
+
+            call_kwargs: Dict[str, Any] = {"model": self.model_name, "contents": contents}
+            if config:
+                call_kwargs["config"] = config
+
+            response = client.models.generate_content(**call_kwargs)
 
             text_output = response.text if response and hasattr(response, "text") else ""
             timestamp = datetime.now(timezone.utc).isoformat()
@@ -358,27 +365,31 @@ class GeminiProvider(BaseProvider):
         system_prompt: Optional[str] = None,
         **kwargs: Any,
     ) -> Generator[StreamChunk, None, None]:
-        """Stream response tokens via Google Gemini API."""
+        """Stream response tokens via Google Gemini API using google-genai SDK."""
         if not self.is_available():
-            raise RuntimeError("GEMINI_API_KEY is not configured or google.generativeai SDK is unavailable.")
+            raise RuntimeError("GEMINI_API_KEY is not configured or google-genai SDK is unavailable.")
 
         try:
-            genai.configure(api_key=Config.GEMINI_API_KEY)
-            model_kwargs: Dict[str, Any] = {}
-            if system_prompt:
-                model_kwargs["system_instruction"] = system_prompt
-
-            model = genai.GenerativeModel(self.model_name, **model_kwargs)
+            client = genai.Client(api_key=Config.GEMINI_API_KEY)
             contents = self._build_contents(message=message, history=history)
             timeout = kwargs.get("timeout", 30)
 
-            response = model.generate_content(
-                contents,
-                stream=True,
-                request_options={"timeout": timeout},
-            )
+            config = None
+            config_kwargs: Dict[str, Any] = {}
+            if system_prompt:
+                config_kwargs["system_instruction"] = system_prompt
+            if timeout and types:
+                config_kwargs["http_options"] = types.HttpOptions(timeout=timeout)
+            if config_kwargs and types:
+                config = types.GenerateContentConfig(**config_kwargs)
 
-            for chunk in response:
+            call_kwargs: Dict[str, Any] = {"model": self.model_name, "contents": contents}
+            if config:
+                call_kwargs["config"] = config
+
+            response_stream = client.models.generate_content_stream(**call_kwargs)
+
+            for chunk in response_stream:
                 chunk_text = chunk.text if hasattr(chunk, "text") else ""
                 if chunk_text:
                     yield StreamChunk(text=chunk_text, is_final=False)

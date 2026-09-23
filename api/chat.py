@@ -265,6 +265,7 @@ def post_chat() -> tuple[Any, int]:
             "ok": True,
             "app": Config.APP_NAME,
             "conversation_id": conversation_id,
+            "answer": ai_response,
             "response": ai_response,
             "provider": active_provider,
             "model": result["model"],

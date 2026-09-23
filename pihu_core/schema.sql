@@ -31,7 +31,7 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE TABLE IF NOT EXISTS memories (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    category TEXT,
+    category TEXT NOT NULL,
     content TEXT NOT NULL,
     timestamp TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );

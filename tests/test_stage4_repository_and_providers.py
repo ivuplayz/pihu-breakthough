@@ -124,15 +124,14 @@ class TestStage4RepositoryAndProviders(unittest.TestCase):
     # --------------------------------------------------------------------------
     # 3. Live AI SDK Provider Tests (Mocked External Calls)
     # --------------------------------------------------------------------------
-    @patch("google.generativeai.GenerativeModel")
-    @patch("google.generativeai.configure")
-    def test_gemini_provider_generate(self, mock_configure: MagicMock, mock_model_cls: MagicMock) -> None:
+    @patch("pihu_core.providers.genai.Client")
+    def test_gemini_provider_generate(self, mock_client_cls: MagicMock) -> None:
         """GeminiProvider correctly formats contents and returns ProviderResponse."""
-        mock_instance = MagicMock()
+        mock_client = MagicMock()
         mock_response = MagicMock()
         mock_response.text = "Hello from Gemini 2.5 Flash!"
-        mock_instance.generate_content.return_value = mock_response
-        mock_model_cls.return_value = mock_instance
+        mock_client.models.generate_content.return_value = mock_response
+        mock_client_cls.return_value = mock_client
 
         with patch.object(Config, "GEMINI_API_KEY", "mock-gemini-key"):
             provider = GeminiProvider(model_name="gemini-2.5-flash")
@@ -147,23 +146,23 @@ class TestStage4RepositoryAndProviders(unittest.TestCase):
             self.assertEqual(res.model, "gemini-2.5-flash")
 
             # Verify contents mapping
-            call_args = mock_instance.generate_content.call_args[0][0]
-            self.assertEqual(len(call_args), 3)
-            self.assertEqual(call_args[0]["role"], "user")
-            self.assertEqual(call_args[1]["role"], "model")  # Assistant mapped to model
-            self.assertEqual(call_args[2]["role"], "user")
+            call_kwargs = mock_client.models.generate_content.call_args[1]
+            contents = call_kwargs["contents"]
+            self.assertEqual(len(contents), 3)
+            self.assertEqual(contents[0]["role"], "user")
+            self.assertEqual(contents[1]["role"], "model")  # Assistant mapped to model
+            self.assertEqual(contents[2]["role"], "user")
 
-    @patch("google.generativeai.GenerativeModel")
-    @patch("google.generativeai.configure")
-    def test_gemini_provider_stream_generate(self, mock_configure: MagicMock, mock_model_cls: MagicMock) -> None:
+    @patch("pihu_core.providers.genai.Client")
+    def test_gemini_provider_stream_generate(self, mock_client_cls: MagicMock) -> None:
         """GeminiProvider yields stream chunks correctly."""
-        mock_instance = MagicMock()
+        mock_client = MagicMock()
         chunk1 = MagicMock()
         chunk1.text = "Hello "
         chunk2 = MagicMock()
         chunk2.text = "world!"
-        mock_instance.generate_content.return_value = [chunk1, chunk2]
-        mock_model_cls.return_value = mock_instance
+        mock_client.models.generate_content_stream.return_value = [chunk1, chunk2]
+        mock_client_cls.return_value = mock_client
 
         with patch.object(Config, "GEMINI_API_KEY", "mock-gemini-key"):
             provider = GeminiProvider()
