@@ -90,7 +90,16 @@ def classify_intent(message: str) -> IntentType:
     if any(k in lower for k in ("offline only", "keep private", "confidential", "local only")):
         return IntentType.LOCAL_PRIVATE
 
-    # 2. Fast Chat checks (short queries, pleasantries)
+    # 2. Summarization checks
+    summarize_indicators = (
+        "summarize", "summarise", "summary", "tldr", "tl;dr",
+        "synopsis", "recap", "brief overview", "key takeaways",
+        "condense", "gist", "in a nutshell", "give me the short version"
+    )
+    if any(k in lower for k in summarize_indicators):
+        return IntentType.SUMMARIZATION
+
+    # 3. Fast Chat checks (short queries, pleasantries)
     greetings = ("hello", "hi", "hey", "good morning", "good evening", "thanks", "thank you", "bye", "who are you")
     if any(lower == g or lower.startswith(g + " ") or lower.startswith(g + "!") or lower.startswith(g + ".") for g in greetings):
         return IntentType.FAST_CHAT
@@ -98,7 +107,7 @@ def classify_intent(message: str) -> IntentType:
     if len(lower) < 25 and not any(c in lower for c in ("def ", "class ", "sql", "explain", "derive")):
         return IntentType.FAST_CHAT
 
-    # 3. Coding & System prompts
+    # 4. Coding & System prompts
     code_indicators = (
         "def ", "class ", "function ", "import ", "sql", "select ", "insert ",
         "update ", "delete ", "json", "traceback", "syntaxerror", "python",
@@ -107,7 +116,7 @@ def classify_intent(message: str) -> IntentType:
     if any(k in lower for k in code_indicators) or "```" in message:
         return IntentType.CODING_SYSTEM
 
-    # 4. Complex Reasoning
+    # 5. Complex Reasoning
     reasoning_indicators = (
         "explain step by step", "prove that", "derive", "compare and contrast",
         "architectural design", "solve", "why does", "what are the implications",
@@ -177,15 +186,18 @@ class ProviderRouter:
                     candidates.append(self._providers[name])
             return candidates
 
+        # Summarization Strategy or Intent
+        if strategy == RoutingStrategy.SUMMARIZATION or intent == IntentType.SUMMARIZATION:
+            order = ("huggingface", "gemini", "groq", "stage1-deterministic")
         # Low Latency Strategy or Fast Chat
-        if strategy == RoutingStrategy.LOW_LATENCY or intent == IntentType.FAST_CHAT:
-            order = ("groq", "gemini", "huggingface", "ollama", "stage1-deterministic")
+        elif strategy == RoutingStrategy.LOW_LATENCY or intent == IntentType.FAST_CHAT:
+            order = ("groq", "gemini", "huggingface", "stage1-deterministic")
         # High Quality Strategy or Complex Reasoning / Coding
         elif strategy == RoutingStrategy.HIGH_QUALITY or intent in (IntentType.COMPLEX_REASONING, IntentType.CODING_SYSTEM):
-            order = ("gemini", "groq", "huggingface", "ollama", "stage1-deterministic")
+            order = ("gemini", "groq", "huggingface", "stage1-deterministic")
         else:
-            # Default balanced chain
-            order = ("gemini", "groq", "huggingface", "ollama", "stage1-deterministic")
+            # Default balanced chain: Gemini -> Groq -> HuggingFace -> Deterministic fallback
+            order = ("gemini", "groq", "huggingface", "stage1-deterministic")
 
         for name in order:
             if name in self._providers:

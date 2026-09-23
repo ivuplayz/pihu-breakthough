@@ -27,6 +27,7 @@ class IntentType(str, Enum):
     FAST_CHAT = "fast_chat"
     COMPLEX_REASONING = "complex_reasoning"
     CODING_SYSTEM = "coding_system"
+    SUMMARIZATION = "summarization"
     LOCAL_PRIVATE = "local_private"
     FALLBACK_SAFE = "fallback_safe"
 
@@ -37,6 +38,7 @@ class RoutingStrategy(str, Enum):
     AUTO = "auto"
     LOW_LATENCY = "low_latency"
     HIGH_QUALITY = "high_quality"
+    SUMMARIZATION = "summarization"
     OFFLINE_ONLY = "offline_only"
     MANUAL = "manual"
 
@@ -279,6 +281,13 @@ try:
 except ImportError:
     Groq = None  # type: ignore
     GROQ_AVAILABLE = False
+
+try:
+    from huggingface_hub import InferenceClient
+    HF_AVAILABLE = True
+except ImportError:
+    InferenceClient = None  # type: ignore
+    HF_AVAILABLE = False
 
 
 class GeminiProvider(BaseProvider):
@@ -794,7 +803,13 @@ class GroqProvider(BaseProvider):
 
 
 class HuggingFaceProvider(BaseProvider):
-    """Hugging Face Inference provider (Tier 3 Specialized Open-Weights Engine)."""
+    """Hugging Face Serverless Inference provider (Tier 3 Specialized Open-Weights Engine).
+
+    Positioned as Tier 3 fallback and specialized for summarization tasks.
+    """
+
+    def __init__(self, model_name: Optional[str] = None) -> None:
+        self._model_name = model_name or Config.HF_MODEL or "meta-llama/Llama-3.2-3B-Instruct"
 
     @property
     def name(self) -> str:
@@ -802,7 +817,7 @@ class HuggingFaceProvider(BaseProvider):
 
     @property
     def model_name(self) -> str:
-        return "Qwen/Qwen2.5-72B-Instruct"
+        return self._model_name
 
     @property
     def capabilities(self) -> ProviderCapabilities:
@@ -810,12 +825,34 @@ class HuggingFaceProvider(BaseProvider):
             supports_streaming=True,
             supports_tools=False,
             max_context_tokens=32768,
-            typical_latency_ms=750,
+            typical_latency_ms=650,
             is_local=False,
         )
 
     def is_available(self) -> bool:
-        return bool(Config.HF_API_KEY and Config.HF_API_KEY.strip())
+        """Check presence of HF_API_KEY and huggingface_hub SDK availability."""
+        return bool(Config.HF_API_KEY and Config.HF_API_KEY.strip() and HF_AVAILABLE)
+
+    def _build_messages(
+        self,
+        message: str,
+        history: Optional[List[Dict[str, str]]] = None,
+        system_prompt: Optional[str] = None,
+    ) -> List[Dict[str, str]]:
+        """Map chat history and system prompt to OpenAI/HF messages format."""
+        messages: List[Dict[str, str]] = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+
+        if history:
+            for item in history:
+                role = item.get("role", "user")
+                if role not in ("system", "user", "assistant"):
+                    role = "user"
+                messages.append({"role": role, "content": item.get("content", "")})
+
+        messages.append({"role": "user", "content": message})
+        return messages
 
     def generate(
         self,
@@ -825,12 +862,91 @@ class HuggingFaceProvider(BaseProvider):
         tools: Optional[List[Any]] = None,
         **kwargs: Any,
     ) -> ProviderResponse:
+        """Generate response via Hugging Face Serverless Inference API."""
         if not self.is_available():
-            raise RuntimeError("HF_API_KEY is not configured.")
+            raise RuntimeError("HF_API_KEY is not configured or huggingface_hub SDK is unavailable.")
 
-        raise NotImplementedError(
-            "Hugging Face live API client execution is scheduled for Stage 4."
-        )
+        try:
+            client = InferenceClient(token=Config.HF_API_KEY, timeout=kwargs.get("timeout", 30))
+            messages = self._build_messages(message=message, history=history, system_prompt=system_prompt)
+            temperature = kwargs.get("temperature", 0.7)
+            max_tokens = kwargs.get("max_tokens", 1024)
+
+            completion = client.chat.completions.create(
+                model=self.model_name,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+
+            reply_text = completion.choices[0].message.content or ""
+            timestamp = datetime.now(timezone.utc).isoformat()
+
+            usage_meta: Dict[str, Any] = {}
+            if hasattr(completion, "usage") and completion.usage:
+                usage_meta = {
+                    "prompt_tokens": getattr(completion.usage, "prompt_tokens", None),
+                    "completion_tokens": getattr(completion.usage, "completion_tokens", None),
+                    "total_tokens": getattr(completion.usage, "total_tokens", None),
+                }
+
+            return ProviderResponse(
+                content=reply_text,
+                provider=self.name,
+                model=self.model_name,
+                metadata={
+                    "stage": Config.STAGE,
+                    "timestamp": timestamp,
+                    "usage": usage_meta,
+                    "provider": self.name,
+                    "model": self.model_name,
+                },
+            )
+        except Exception as exc:
+            sanitized_err = str(exc).replace(Config.HF_API_KEY or "", "***") if Config.HF_API_KEY else str(exc)
+            logger.error("HuggingFace API call failed: %s", sanitized_err)
+            raise RuntimeError(f"HuggingFace API error: {sanitized_err}") from exc
+
+    def stream_generate(
+        self,
+        message: str,
+        history: Optional[List[Dict[str, str]]] = None,
+        system_prompt: Optional[str] = None,
+        tools: Optional[List[Any]] = None,
+        **kwargs: Any,
+    ) -> Generator[StreamChunk, None, None]:
+        """Stream response tokens via Hugging Face Serverless Inference API."""
+        if not self.is_available():
+            raise RuntimeError("HF_API_KEY is not configured or huggingface_hub SDK is unavailable.")
+
+        try:
+            client = InferenceClient(token=Config.HF_API_KEY, timeout=kwargs.get("timeout", 30))
+            messages = self._build_messages(message=message, history=history, system_prompt=system_prompt)
+            temperature = kwargs.get("temperature", 0.7)
+            max_tokens = kwargs.get("max_tokens", 1024)
+
+            stream = client.chat.completions.create(
+                model=self.model_name,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                stream=True,
+            )
+
+            for chunk in stream:
+                delta = ""
+                if hasattr(chunk, "choices") and chunk.choices:
+                    choice = chunk.choices[0]
+                    if hasattr(choice, "delta") and hasattr(choice.delta, "content") and choice.delta.content:
+                        delta = choice.delta.content
+                if delta:
+                    yield StreamChunk(text=delta, is_final=False)
+
+            yield StreamChunk(text="", is_final=True)
+        except Exception as exc:
+            sanitized_err = str(exc).replace(Config.HF_API_KEY or "", "***") if Config.HF_API_KEY else str(exc)
+            logger.error("HuggingFace stream failed: %s", sanitized_err)
+            raise RuntimeError(f"HuggingFace streaming error: {sanitized_err}") from exc
 
 
 class OllamaProvider(BaseProvider):

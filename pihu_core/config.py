@@ -56,6 +56,7 @@ class Config:
     GEMINI_API_KEY: str | None = os.getenv("GEMINI_API_KEY")
     GROQ_API_KEY: str | None = os.getenv("GROQ_API_KEY")
     HF_API_KEY: str | None = os.getenv("HF_API_KEY")
+    HF_MODEL: str = os.getenv("HF_MODEL", "meta-llama/Llama-3.2-3B-Instruct")
     OLLAMA_BASE_URL: str = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 
     @classmethod
