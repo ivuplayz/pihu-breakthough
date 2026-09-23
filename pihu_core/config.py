@@ -33,7 +33,7 @@ class Config:
 
     APP_NAME: str = "Pihu-BreakThough"
     VERSION: str = "1.0.0"
-    STAGE: str = "Stage 4"
+    STAGE: str = "Stage 9"
 
     # Server settings
     ENV: str = os.getenv("FLASK_ENV") or "production"
@@ -43,9 +43,9 @@ class Config:
         os.getenv("SECRET_KEY") or "pihu-breakthough-dev-insecure-secret-key"
     )
 
-    # Maximum payload size (16 MB default to accommodate multimodal image payloads)
+    # Maximum payload size (4 MB default to accommodate multimodal payloads within Vercel edge limits)
     MAX_CONTENT_LENGTH: int = _safe_int(
-        os.getenv("MAX_CONTENT_LENGTH"), 16 * 1024 * 1024
+        os.getenv("MAX_CONTENT_LENGTH"), 4 * 1024 * 1024
     )
 
 

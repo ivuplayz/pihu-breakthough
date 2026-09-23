@@ -226,15 +226,15 @@ class TestVisionPayloadValidation(unittest.TestCase):
     def test_rejects_oversized_image(self) -> None:
         """Verify 400 when decoded image exceeds 5MB safe limit."""
         huge_bytes = b"0" * (5 * 1024 * 1024 + 10)
-        huge_b64 = base64.b64encode(huge_bytes).decode("utf-8")
-        payload = {
-            "message": "Test oversized",
-            "images": [{"data": huge_b64, "mime_type": "image/png"}],
-        }
-        response = self.client.post("/api/chat", json=payload)
-        self.assertEqual(response.status_code, 400)
-        data = response.get_json()
-        self.assertEqual(data["error"]["code"], "IMAGE_TOO_LARGE")
+        with patch("base64.b64decode", return_value=huge_bytes):
+            payload = {
+                "message": "Test oversized",
+                "images": [{"data": SAMPLE_PNG_B64, "mime_type": "image/png"}],
+            }
+            response = self.client.post("/api/chat", json=payload)
+            self.assertEqual(response.status_code, 400)
+            data = response.get_json()
+            self.assertEqual(data["error"]["code"], "IMAGE_TOO_LARGE")
 
 
 class TestGeminiProviderVisionIntegration(unittest.TestCase):
